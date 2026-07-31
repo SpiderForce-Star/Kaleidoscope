@@ -1,0 +1,84 @@
+# GitHub Pages issues and renews Let's Encrypt certs automatically.
+# This workflow does NOT renew certs — it monitors that HTTPS stays healthy
+# and alerts (workflow fails) if the cert is missing, invalid, or near expiry.
+name: SSL / HTTPS health
+
+on:
+  schedule:
+    # Weekly Monday 14:00 UTC
+    - cron: "0 14 * * 1"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/ssl-health.yml"
+      - "spa/public/CNAME"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ssl-health
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check custom domain HTTPS
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve domain + fetch certificate
+        env:
+          DOMAIN: kaleidoscope.webbspinnervisions.net
+          # Fail if cert expires within this many days
+          MIN_DAYS: "14"
+        run: |
+          set -euo pipefail
+
+          echo "== DNS =="
+          getent ahosts "$DOMAIN" | awk '{print $1}' | sort -u || true
+
+          echo "== HTTPS HEAD =="
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 20 "https://${DOMAIN}/")
+          echo "HTTP status: $code"
+          test "$code" = "200"
+
+          echo "== HTTP → HTTPS redirect =="
+          loc=$(curl -sS -o /dev/null -w "%{redirect_url}" --max-time 20 "http://${DOMAIN}/" || true)
+          echo "Redirect: $loc"
+          echo "$loc" | grep -q "https://${DOMAIN}"
+
+          echo "== Certificate =="
+          # openssl s_client prints PEM; parse notAfter
+          end_date=$(
+            echo | openssl s_client -servername "$DOMAIN" -connect "${DOMAIN}:443" 2>/dev/null \
+              | openssl x509 -noout -enddate \
+              | cut -d= -f2
+          )
+          echo "notAfter: $end_date"
+          end_epoch=$(date -d "$end_date" +%s)
+          now_epoch=$(date +%s)
+          days_left=$(( (end_epoch - now_epoch) / 86400 ))
+          echo "days_left: $days_left"
+
+          if [ "$days_left" -lt "$MIN_DAYS" ]; then
+            echo "::error::Certificate for ${DOMAIN} expires in ${days_left} days (threshold ${MIN_DAYS})."
+            echo "GitHub Pages normally auto-renews. Check Settings → Pages → Custom domain / Enforce HTTPS."
+            exit 1
+          fi
+
+          subject=$(
+            echo | openssl s_client -servername "$DOMAIN" -connect "${DOMAIN}:443" 2>/dev/null \
+              | openssl x509 -noout -subject
+          )
+          echo "$subject"
+          echo "$subject" | grep -qi "$DOMAIN" || echo "::warning::Subject may not list ${DOMAIN} (SAN still valid if curl HTTPS works)."
+
+          echo "== Assets =="
+          # Confirm relative assets load (CSS path from index)
+          css=$(curl -sS "https://${DOMAIN}/" | grep -oE 'assets/[^"]+\.css' | head -1)
+          echo "CSS path: $css"
+          test -n "$css"
+          curl -sS -o /dev/null -w "css:%{http_code}\n" --max-time 20 "https://${DOMAIN}/${css}" | tee /tmp/css-status.txt
+          grep -q "css:200" /tmp/css-status.txt
+
+          echo "OK — HTTPS healthy; cert auto-renewal is managed by GitHub Pages."

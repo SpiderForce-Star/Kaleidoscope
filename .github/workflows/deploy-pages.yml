@@ -31,8 +31,12 @@ jobs:
       - name: Build SPA
         run: npm run build:spa
 
-      - name: SPA fallback
-        run: cp dist/index.html dist/404.html
+      - name: SPA fallback + CNAME
+        run: |
+          cp dist/index.html dist/404.html
+          # Keep custom domain across orphan deploys
+          echo "kaleidoscope.webbspinnervisions.net" > dist/CNAME
+          touch dist/.nojekyll
 
       - name: Deploy to gh-pages
         uses: peaceiris/actions-gh-pages@v4
@@ -40,3 +44,5 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./dist
           force_orphan: true
+          # Explicit custom domain (also written via CNAME file above)
+          cname: kaleidoscope.webbspinnervisions.net

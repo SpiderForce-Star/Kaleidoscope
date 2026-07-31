@@ -48,6 +48,15 @@ DNS is managed at your registrar (same place as `webbspinnervisions.net`). After
 
 The `CNAME` file on the `gh-pages` branch is set to `kaleidoscope.webbspinnervisions.net`.
 
+
+## SSL / HTTPS
+
+GitHub Pages **automatically issues and renews** the free certificate for `kaleidoscope.webbspinnervisions.net`.
+
+- **Enforce HTTPS** is on in repo Settings → Pages.
+- Workflow [`.github/workflows/ssl-health.yml`](.github/workflows/ssl-health.yml) runs weekly and fails if HTTPS is down or the cert is within 14 days of expiry (monitor only — it does not renew certs).
+- Manual check: **Actions → SSL / HTTPS health → Run workflow**.
+
 ## Deploy
 
 ### GitHub Pages (automatic)
