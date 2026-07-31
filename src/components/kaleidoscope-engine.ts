@@ -18,9 +18,7 @@ export interface KaleidoscopeSettings {
   frozen: boolean;
   hueShift: number;
   monoHue: number;
-  /** Fixed symmetry-axis angle in degrees (0–360). */
   axisAngle: number;
-  /** Continuous axis spin speed in degrees per second (0 = fixed). */
   axisSpin: number;
 }
 
@@ -49,7 +47,6 @@ export const DEFAULT_SETTINGS: KaleidoscopeSettings = {
   axisSpin: 0,
 };
 
-/** One-tap seed looks — settings + demo stroke style */
 export type DemoPath = "spiral" | "burst" | "orbit" | "ribbon" | "web";
 
 export interface SeedLook {
@@ -188,7 +185,7 @@ export interface UserPreset {
 
 const PRESET_KEY = "wsv-kaleidoscope-presets-v1";
 const MAX_PRESETS = 12;
-const MAX_UNDO = 24;
+const MAX_UNDO = 16;
 
 export function loadPresets(): UserPreset[] {
   try {
@@ -311,11 +308,19 @@ export function randomizeSettings(
   };
 }
 
+/** GPU-friendly canvas snapshot (no getImageData CPU readback). */
 type Snapshot = {
-  data: ImageData;
+  canvas: HTMLCanvasElement;
   hasContent: boolean;
   pathLen: number;
   spinAccum: number;
+  w: number;
+  h: number;
+};
+
+export type EngineNotify = {
+  canUndo?: boolean;
+  settings?: KaleidoscopeSettings;
 };
 
 export class KaleidoscopeEngine {
@@ -337,29 +342,46 @@ export class KaleidoscopeEngine {
   private autoHue = 0;
   private hasContent = false;
   private prevFrame = 0;
-  /** Accumulated continuous spin in degrees (added to axisAngle). */
   private spinAccum = 0;
-  private onChange?: () => void;
+  private onNotify?: (n: EngineNotify) => void;
   private history: Snapshot[] = [];
   private strokeOpen = false;
   private demoAbort = false;
   private demoTimer = 0;
 
+  // Cached geometry for current stroke / frame
+  private rectLeft = 0;
+  private rectTop = 0;
+  private axisCos = 1;
+  private axisSin = 0;
+  private axisCosInv = 1;
+  private axisSinInv = 0;
+  private axisCacheDeg = Number.NaN;
+  private resizeTimer = 0;
+  private trailAcc = 0;
+  private needsComposite = false;
+  private glowMode = true;
+
   constructor(
     canvas: HTMLCanvasElement,
     settings: KaleidoscopeSettings,
-    onChange?: () => void,
+    onNotify?: (n: EngineNotify) => void,
   ) {
     this.canvas = canvas;
-    const ctx = canvas.getContext("2d", { alpha: false, willReadFrequently: true });
+    // Prefer drawing speed; undo uses canvas copies, not getImageData
+    const ctx = canvas.getContext("2d", {
+      alpha: false,
+      desynchronized: true,
+    });
     if (!ctx) throw new Error("2d context unavailable");
     this.ctx = ctx;
     this.settings = { ...settings };
-    this.onChange = onChange;
+    this.onNotify = onNotify;
+    this.glowMode = settings.glow || settings.colorMode === "neon";
   }
 
   mount() {
-    this.resize();
+    this.resizeNow();
     this.clear(false);
     this.bind();
     this.prevFrame = performance.now();
@@ -368,13 +390,20 @@ export class KaleidoscopeEngine {
 
   unmount() {
     cancelAnimationFrame(this.raf);
+    if (this.resizeTimer) window.clearTimeout(this.resizeTimer);
     this.cancelDemo();
     this.unbind();
+    this.history = [];
   }
 
-  setSettings(partial: Partial<KaleidoscopeSettings>) {
+  setSettings(partial: Partial<KaleidoscopeSettings>, notify = false) {
     this.settings = { ...this.settings, ...partial };
-    this.onChange?.();
+    this.glowMode = this.settings.glow || this.settings.colorMode === "neon";
+    // Axis cache invalidates on angle change; spin updates every frame
+    if (partial.axisAngle !== undefined) this.axisCacheDeg = Number.NaN;
+    if (notify) {
+      this.onNotify?.({ settings: this.settings, canUndo: this.canUndo() });
+    }
   }
 
   getSettings() {
@@ -385,32 +414,63 @@ export class KaleidoscopeEngine {
     return this.history.length > 0;
   }
 
-  /** Effective axis rotation in radians (fixed angle + live spin). */
   getEffectiveAxisRad() {
     const deg =
       (((this.settings.axisAngle + this.spinAccum) % 360) + 360) % 360;
     return (deg * Math.PI) / 180;
   }
 
-  resize = () => {
+  getEffectiveAxisDeg() {
+    return (((this.settings.axisAngle + this.spinAccum) % 360) + 360) % 360;
+  }
+
+  private updateAxisCache() {
+    const deg = this.getEffectiveAxisDeg();
+    // Recompute only when angle moved ~0.15°
+    if (Math.abs(deg - this.axisCacheDeg) < 0.15) return;
+    this.axisCacheDeg = deg;
+    const axis = (deg * Math.PI) / 180;
+    this.axisCos = Math.cos(axis);
+    this.axisSin = Math.sin(axis);
+    this.axisCosInv = Math.cos(-axis);
+    this.axisSinInv = Math.sin(-axis);
+  }
+
+  private resize = () => {
+    // Debounce layout thrash on mobile chrome / panel open
+    if (this.resizeTimer) window.clearTimeout(this.resizeTimer);
+    this.resizeTimer = window.setTimeout(() => {
+      this.resizeTimer = 0;
+      this.resizeNow();
+    }, 80);
+  };
+
+  private resizeNow = () => {
     const parent = this.canvas.parentElement ?? document.body;
     const rect = parent.getBoundingClientRect();
     const nextW = Math.max(1, Math.floor(rect.width));
     const nextH = Math.max(1, Math.floor(rect.height));
-    const nextDpr = Math.min(window.devicePixelRatio || 1, 2);
+    // Cap DPR on large screens for fill-rate; keep 2 on small/retina
+    const area = nextW * nextH;
+    const dprCap = area > 1_400_000 ? 1.5 : 2;
+    const nextDpr = Math.min(window.devicePixelRatio || 1, dprCap);
 
-    let snapshot: ImageData | null = null;
+    if (
+      nextW === this.w &&
+      nextH === this.h &&
+      Math.abs(nextDpr - this.dpr) < 0.01
+    ) {
+      return;
+    }
+
+    // Preserve via drawImage (no CPU readback)
+    let keep: HTMLCanvasElement | null = null;
     if (this.w > 0 && this.h > 0 && this.hasContent) {
-      try {
-        snapshot = this.ctx.getImageData(
-          0,
-          0,
-          this.canvas.width,
-          this.canvas.height,
-        );
-      } catch {
-        snapshot = null;
-      }
+      keep = document.createElement("canvas");
+      keep.width = this.canvas.width;
+      keep.height = this.canvas.height;
+      const kctx = keep.getContext("2d");
+      if (kctx) kctx.drawImage(this.canvas, 0, 0);
     }
 
     this.dpr = nextDpr;
@@ -424,39 +484,43 @@ export class KaleidoscopeEngine {
     this.cx = this.w / 2;
     this.cy = this.h / 2;
 
+    this.ctx.globalCompositeOperation = "source-over";
     this.ctx.fillStyle = "#070708";
     this.ctx.fillRect(0, 0, this.w, this.h);
 
-    if (snapshot) {
-      const off = document.createElement("canvas");
-      off.width = snapshot.width;
-      off.height = snapshot.height;
-      const octx = off.getContext("2d");
-      if (octx) {
-        octx.putImageData(snapshot, 0, 0);
-        this.ctx.drawImage(off, 0, 0, this.w, this.h);
-        this.hasContent = true;
-      }
+    if (keep) {
+      this.ctx.drawImage(keep, 0, 0, this.w, this.h);
+      this.hasContent = true;
     }
 
-    // Canvas size change invalidates history pixel buffers
     this.history = [];
-    this.onChange?.();
+    this.axisCacheDeg = Number.NaN;
+    this.cacheRect();
+    this.onNotify?.({ canUndo: false });
   };
 
+  private cacheRect() {
+    const rect = this.canvas.getBoundingClientRect();
+    this.rectLeft = rect.left;
+    this.rectTop = rect.top;
+  }
+
   private captureSnapshot(): Snapshot | null {
+    if (this.w < 1 || this.h < 1) return null;
     try {
-      const data = this.ctx.getImageData(
-        0,
-        0,
-        this.canvas.width,
-        this.canvas.height,
-      );
+      const off = document.createElement("canvas");
+      off.width = this.canvas.width;
+      off.height = this.canvas.height;
+      const octx = off.getContext("2d");
+      if (!octx) return null;
+      octx.drawImage(this.canvas, 0, 0);
       return {
-        data,
+        canvas: off,
         hasContent: this.hasContent,
         pathLen: this.pathLen,
         spinAccum: this.spinAccum,
+        w: this.w,
+        h: this.h,
       };
     } catch {
       return null;
@@ -466,20 +530,32 @@ export class KaleidoscopeEngine {
   private restoreSnapshot(snap: Snapshot) {
     this.ctx.save();
     this.ctx.setTransform(1, 0, 0, 1, 0, 0);
-    this.ctx.putImageData(snap.data, 0, 0);
+    this.ctx.globalCompositeOperation = "source-over";
+    this.ctx.fillStyle = "#070708";
+    this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    this.ctx.drawImage(
+      snap.canvas,
+      0,
+      0,
+      this.canvas.width,
+      this.canvas.height,
+    );
     this.ctx.restore();
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     this.hasContent = snap.hasContent;
     this.pathLen = snap.pathLen;
     this.spinAccum = snap.spinAccum;
+    this.axisCacheDeg = Number.NaN;
   }
 
   pushHistory() {
     const snap = this.captureSnapshot();
     if (!snap) return;
     this.history.push(snap);
-    if (this.history.length > MAX_UNDO) this.history.shift();
-    this.onChange?.();
+    while (this.history.length > MAX_UNDO) {
+      this.history.shift();
+    }
+    this.onNotify?.({ canUndo: true });
   }
 
   undo(): boolean {
@@ -489,13 +565,13 @@ export class KaleidoscopeEngine {
     this.restoreSnapshot(snap);
     this.drawing = false;
     this.strokeOpen = false;
-    this.onChange?.();
+    this.onNotify?.({ canUndo: this.canUndo() });
     return true;
   }
 
   clear(recordHistory = true) {
     this.cancelDemo();
-    if (recordHistory) this.pushHistory();
+    if (recordHistory && this.hasContent) this.pushHistory();
     this.ctx.save();
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     this.ctx.globalCompositeOperation = "source-over";
@@ -504,7 +580,7 @@ export class KaleidoscopeEngine {
     this.ctx.restore();
     this.hasContent = false;
     this.pathLen = 0;
-    this.onChange?.();
+    this.onNotify?.({ canUndo: this.canUndo() });
   }
 
   exportPng(): string {
@@ -519,22 +595,20 @@ export class KaleidoscopeEngine {
     }
   }
 
-  /**
-   * Apply settings, clear canvas, and animate a seed demo stroke.
-   */
   async playSeed(seed: SeedLook): Promise<void> {
     this.cancelDemo();
     this.demoAbort = false;
     this.settings = { ...seed.settings, frozen: false };
+    this.glowMode = this.settings.glow || this.settings.colorMode === "neon";
     this.spinAccum = 0;
+    this.axisCacheDeg = Number.NaN;
     this.clear(true);
-    this.onChange?.();
+    this.onNotify?.({ settings: this.settings, canUndo: this.canUndo() });
 
     const maxR = Math.min(this.w, this.h) * 0.38;
     const points = this.buildDemoPath(seed.demo, maxR);
     if (points.length < 2) return;
 
-    // Draw along path over ~1.4s
     const duration = 1400;
     const start = performance.now();
     let lastIdx = 0;
@@ -546,8 +620,7 @@ export class KaleidoscopeEngine {
           return;
         }
         const t = clamp((now - start) / duration, 0, 1);
-        // ease-out cubic
-        const e = 1 - Math.pow(1 - t, 3);
+        const e = 1 - (1 - t) * (1 - t) * (1 - t);
         const idx = Math.min(
           points.length - 1,
           Math.floor(e * (points.length - 1)),
@@ -577,7 +650,7 @@ export class KaleidoscopeEngine {
     const pts: { x: number; y: number }[] = [];
     const cx = this.cx;
     const cy = this.cy;
-    const n = 90;
+    const n = 72; // slightly fewer demo samples
 
     if (kind === "spiral") {
       for (let i = 0; i <= n; i++) {
@@ -603,16 +676,16 @@ export class KaleidoscopeEngine {
     } else if (kind === "ribbon") {
       for (let i = 0; i <= n; i++) {
         const t = i / n;
-        const x = cx + (t - 0.5) * maxR * 1.7;
-        const y = cy + Math.sin(t * Math.PI * 3) * maxR * 0.45;
-        pts.push({ x, y });
+        pts.push({
+          x: cx + (t - 0.5) * maxR * 1.7,
+          y: cy + Math.sin(t * Math.PI * 3) * maxR * 0.45,
+        });
       }
     } else {
-      // web — radial spokes then arc (spider-inspired)
       for (let s = 0; s < 5; s++) {
         const ang = (s / 5) * Math.PI * 2 - Math.PI / 2;
-        for (let i = 0; i <= 12; i++) {
-          const t = i / 12;
+        for (let i = 0; i <= 10; i++) {
+          const t = i / 10;
           const r = maxR * 0.12 + t * maxR * 0.88;
           pts.push({
             x: cx + Math.cos(ang) * r,
@@ -620,8 +693,8 @@ export class KaleidoscopeEngine {
           });
         }
       }
-      for (let i = 0; i <= 40; i++) {
-        const t = i / 40;
+      for (let i = 0; i <= 32; i++) {
+        const t = i / 32;
         const ang = t * Math.PI * 2;
         const r = maxR * 0.72;
         pts.push({ x: cx + Math.cos(ang) * r, y: cy + Math.sin(ang) * r });
@@ -631,9 +704,11 @@ export class KaleidoscopeEngine {
   }
 
   private bind() {
-    window.addEventListener("resize", this.resize);
+    window.addEventListener("resize", this.resize, { passive: true });
     this.canvas.addEventListener("pointerdown", this.onPointerDown);
-    window.addEventListener("pointermove", this.onPointerMove);
+    window.addEventListener("pointermove", this.onPointerMove, {
+      passive: false,
+    });
     window.addEventListener("pointerup", this.onPointerUp);
     window.addEventListener("pointercancel", this.onPointerUp);
   }
@@ -647,10 +722,9 @@ export class KaleidoscopeEngine {
   }
 
   private pointerPos(e: PointerEvent) {
-    const rect = this.canvas.getBoundingClientRect();
     return {
-      x: e.clientX - rect.left,
-      y: e.clientY - rect.top,
+      x: e.clientX - this.rectLeft,
+      y: e.clientY - this.rectTop,
     };
   }
 
@@ -659,16 +733,18 @@ export class KaleidoscopeEngine {
     if (e.button !== undefined && e.button !== 0) return;
     e.preventDefault();
     this.cancelDemo();
+    this.cacheRect();
     try {
       this.canvas.setPointerCapture(e.pointerId);
     } catch {
-      /* synthetic / already captured */
+      /* already captured */
     }
     if (!this.strokeOpen) {
       this.pushHistory();
       this.strokeOpen = true;
     }
     this.drawing = true;
+    this.updateAxisCache();
     const { x, y } = this.pointerPos(e);
     this.lastX = x;
     this.lastY = y;
@@ -684,6 +760,8 @@ export class KaleidoscopeEngine {
     const now = performance.now();
     const dt = Math.max(1, now - this.lastTime);
     const dist = Math.hypot(x - this.lastX, y - this.lastY);
+    // Skip micro-moves (touch jitter) — big win on mobile
+    if (dist < 0.6) return;
     const speed = dist / dt;
     this.stampLine(this.lastX, this.lastY, x, y, speed);
     this.lastX = x;
@@ -701,7 +779,7 @@ export class KaleidoscopeEngine {
     }
     this.drawing = false;
     this.strokeOpen = false;
-    this.onChange?.();
+    this.onNotify?.({ canUndo: this.canUndo() });
   };
 
   private stampLine(
@@ -712,103 +790,96 @@ export class KaleidoscopeEngine {
     speed: number,
   ) {
     const dist = Math.hypot(x1 - x0, y1 - y0);
-    const step = Math.max(1.2, this.settings.brushSize * 0.16);
+    // Adaptive step: denser when slow/small brush, sparser when fast
+    const brush = this.settings.brushSize;
+    const speedBoost = Math.min(2.2, 1 + speed * 2.5);
+    const step = Math.max(1.6, brush * 0.22 * speedBoost);
     const n = Math.max(1, Math.ceil(dist / step));
-    for (let i = 0; i <= n; i++) {
-      const t = i / n;
+    // Cap stamps per move event to avoid spiral-of-death on large jumps
+    const maxStamps = 28;
+    const stride = n > maxStamps ? n / maxStamps : 1;
+
+    this.updateAxisCache();
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.globalCompositeOperation = this.glowMode ? "lighter" : "source-over";
+
+    for (let i = 0; i <= n; i += stride) {
+      const t = Math.min(1, i / n);
       const x = x0 + (x1 - x0) * t;
       const y = y0 + (y1 - y0) * t;
-      this.stamp(x, y, speed);
-      this.pathLen += step;
+      this.stampInto(ctx, x, y, speed);
+      this.pathLen += step * (stride > 1 ? stride : 1);
     }
+    ctx.restore();
+    this.hasContent = true;
   }
 
-  private stamp(px: number, py: number, speed: number) {
+  private stampInto(
+    ctx: CanvasRenderingContext2D,
+    px: number,
+    py: number,
+    speed: number,
+  ) {
     const dx = px - this.cx;
     const dy = py - this.cy;
     const radius = Math.hypot(dx, dy);
     const angle = Math.atan2(dy, dx);
-    const time = performance.now();
     const c = colorForPoint(this.settings, {
       angle,
       radius,
       speed: speed || this.lastSpeed,
       pathLen: this.pathLen,
-      time: time + this.autoHue * 1000,
+      time: performance.now() + this.autoHue * 1000,
     });
 
     const size =
       this.settings.brushSize *
       (0.85 + Math.min(1.4, (speed || this.lastSpeed) * 3.5) * 0.4);
 
-    const points = this.symmetryPoints(dx, dy);
-    const ctx = this.ctx;
-    ctx.save();
-    if (this.settings.glow || this.settings.colorMode === "neon") {
-      ctx.globalCompositeOperation = "lighter";
-    } else {
-      ctx.globalCompositeOperation = "source-over";
-    }
-
-    for (const p of points) {
-      const x = this.cx + p.x;
-      const y = this.cy + p.y;
-      const g = ctx.createRadialGradient(x, y, 0, x, y, size);
-      g.addColorStop(0, hsla(c.h, c.s, Math.min(78, c.l + 8), c.a));
-      g.addColorStop(0.4, hsla(c.h, c.s, c.l, c.a * 0.45));
-      g.addColorStop(1, hsla(c.h, c.s, c.l, 0));
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(x, y, size, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    ctx.restore();
-    this.hasContent = true;
-  }
-
-  /**
-   * Dihedral / rotational symmetry with rotatable axes.
-   * Input is rotated into the axis frame, mirrored, then rotated back.
-   */
-  private symmetryPoints(dx: number, dy: number): { x: number; y: number }[] {
+    // Rotate into axis frame once
+    const lx = dx * this.axisCosInv - dy * this.axisSinInv;
+    const ly = dx * this.axisSinInv + dy * this.axisCosInv;
+    const a0 = Math.atan2(ly, lx);
+    const r = radius;
     const segs = Math.max(2, Math.floor(this.settings.segments));
     const slice = (Math.PI * 2) / segs;
-    const out: { x: number; y: number }[] = [];
-    const r = Math.hypot(dx, dy);
+    const cosB = this.axisCos;
+    const sinB = this.axisSin;
+    const mirror = this.settings.mirror;
 
-    const axis = this.getEffectiveAxisRad();
-    // Rotate into axis frame
-    const cos = Math.cos(-axis);
-    const sin = Math.sin(-axis);
-    const lx = dx * cos - dy * sin;
-    const ly = dx * sin + dy * cos;
-    const a0 = Math.atan2(ly, lx);
+    // Soft disc without createRadialGradient (much cheaper)
+    const core = hsla(c.h, c.s, Math.min(78, c.l + 8), c.a * 0.85);
+    const mid = hsla(c.h, c.s, c.l, c.a * 0.28);
 
-    const cosB = Math.cos(axis);
-    const sinB = Math.sin(axis);
-
-    const pushWorld = (localAngle: number) => {
+    const drawAt = (localAngle: number) => {
       const wx = Math.cos(localAngle) * r;
       const wy = Math.sin(localAngle) * r;
-      // Rotate back to world
-      out.push({
-        x: wx * cosB - wy * sinB,
-        y: wx * sinB + wy * cosB,
-      });
+      const x = this.cx + wx * cosB - wy * sinB;
+      const y = this.cy + wx * sinB + wy * cosB;
+      ctx.fillStyle = core;
+      ctx.beginPath();
+      ctx.arc(x, y, size * 0.42, 0, Math.PI * 2);
+      ctx.fill();
+      if (this.glowMode) {
+        ctx.fillStyle = mid;
+        ctx.beginPath();
+        ctx.arc(x, y, size, 0, Math.PI * 2);
+        ctx.fill();
+      }
     };
 
-    if (this.settings.mirror) {
+    if (mirror) {
       for (let i = 0; i < segs; i++) {
         const base = i * slice;
-        pushWorld(base + a0);
-        pushWorld(base - a0);
+        drawAt(base + a0);
+        drawAt(base - a0);
       }
     } else {
       for (let i = 0; i < segs; i++) {
-        pushWorld(a0 + i * slice);
+        drawAt(a0 + i * slice);
       }
     }
-    return out;
   }
 
   private loop = (now: number) => {
@@ -816,27 +887,43 @@ export class KaleidoscopeEngine {
     const dt = Math.min(0.05, (now - this.prevFrame) / 1000);
     this.prevFrame = now;
 
-    if (this.settings.frozen) return;
-
-    // Continuous symmetry-axis spin
-    if (this.settings.axisSpin !== 0) {
-      this.spinAccum =
-        (this.spinAccum + this.settings.axisSpin * dt) % 360;
+    const s = this.settings;
+    if (s.frozen) {
+      // Still advance hue clock lightly for when unfrozen
+      this.autoHue += dt * 0.2;
+      return;
     }
 
-    // trail: 0 = permanent, 1 = short-lived
-    const trail = this.settings.trail;
+    let work = false;
+
+    if (s.axisSpin !== 0) {
+      this.spinAccum = (this.spinAccum + s.axisSpin * dt) % 360;
+      this.axisCacheDeg = Number.NaN;
+      work = true;
+    }
+
+    // Trail fade — batch into ~30fps updates when idle
+    const trail = s.trail;
     if (trail > 0.001 && this.hasContent && !this.drawing) {
-      const fadePerSec = 0.15 + trail * 1.4;
-      const alpha = 1 - Math.exp(-fadePerSec * dt);
-      this.ctx.save();
-      this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-      this.ctx.globalCompositeOperation = "source-over";
-      this.ctx.fillStyle = `rgba(7, 7, 8, ${clamp(alpha, 0, 0.45)})`;
-      this.ctx.fillRect(0, 0, this.w, this.h);
-      this.ctx.restore();
+      this.trailAcc += dt;
+      const interval = trail > 0.5 ? 1 / 45 : 1 / 30;
+      if (this.trailAcc >= interval) {
+        const fadePerSec = 0.15 + trail * 1.4;
+        const alpha = 1 - Math.exp(-fadePerSec * this.trailAcc);
+        this.ctx.save();
+        this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+        this.ctx.globalCompositeOperation = "source-over";
+        this.ctx.fillStyle = `rgba(7, 7, 8, ${clamp(alpha, 0, 0.42)})`;
+        this.ctx.fillRect(0, 0, this.w, this.h);
+        this.ctx.restore();
+        this.trailAcc = 0;
+        work = true;
+      }
+    } else {
+      this.trailAcc = 0;
     }
 
     this.autoHue += dt;
+    this.needsComposite = work;
   };
 }

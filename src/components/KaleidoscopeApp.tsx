@@ -37,9 +37,8 @@ import {
   type UserPreset,
 } from "./kaleidoscope-engine";
 
-// Vite base-relative asset for GitHub Pages + custom domain
 const SPIDER_SRC = `${import.meta.env.BASE_URL}spider.jpg`.replace(
-  /\/{2,}/g,
+  /(?<!:)\/{2,}/g,
   "/",
 );
 
@@ -90,6 +89,8 @@ export function KaleidoscopeApp() {
   const [creditSoft, setCreditSoft] = useState(true);
   const [demoPlaying, setDemoPlaying] = useState(false);
   const axisSpinRef = useRef(0);
+  const showAxesRef = useRef(false);
+  const lastAxisUi = useRef(0);
 
   const pushToast = useCallback((msg: string) => {
     setToast(msg);
@@ -97,16 +98,15 @@ export function KaleidoscopeApp() {
   }, []);
 
   const syncEngineFlags = useCallback(() => {
-    const eng = engineRef.current;
-    setCanUndo(eng?.canUndo() ?? false);
+    setCanUndo(engineRef.current?.canUndo() ?? false);
   }, []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const engine = new KaleidoscopeEngine(canvas, DEFAULT_SETTINGS, () => {
-      setCanUndo(engine.canUndo());
-      setSettings({ ...engine.getSettings() });
+    const engine = new KaleidoscopeEngine(canvas, DEFAULT_SETTINGS, (n) => {
+      if (n.canUndo !== undefined) setCanUndo(n.canUndo);
+      if (n.settings) setSettings({ ...n.settings });
     });
     engineRef.current = engine;
     engine.mount();
@@ -127,12 +127,26 @@ export function KaleidoscopeApp() {
   }, [settings.axisSpin]);
 
   useEffect(() => {
+    showAxesRef.current = showAxes;
+  }, [showAxes]);
+
+  // Axis angle UI — only when needed, throttled (~12 Hz)
+  useEffect(() => {
     let raf = 0;
-    const tick = () => {
+    let lastPub = 0;
+    const tick = (now: number) => {
       const eng = engineRef.current;
-      if (eng) {
-        const deg = (eng.getEffectiveAxisRad() * 180) / Math.PI;
-        setLiveAxisDeg(((deg % 360) + 360) % 360);
+      const need =
+        showAxesRef.current ||
+        axisSpinRef.current > 0 ||
+        (eng?.getSettings().axisSpin ?? 0) > 0;
+      if (eng && need && now - lastPub > 80) {
+        const deg = eng.getEffectiveAxisDeg();
+        if (Math.abs(deg - lastAxisUi.current) >= 0.4) {
+          lastAxisUi.current = deg;
+          setLiveAxisDeg(deg);
+          lastPub = now;
+        }
       }
       raf = requestAnimationFrame(tick);
     };
@@ -149,14 +163,14 @@ export function KaleidoscopeApp() {
   const update = useCallback((partial: Partial<KaleidoscopeSettings>) => {
     setSettings((prev) => {
       const next = { ...prev, ...partial };
-      engineRef.current?.setSettings(partial);
+      engineRef.current?.setSettings(partial, false);
       return next;
     });
   }, []);
 
   const applyFullSettings = useCallback((next: KaleidoscopeSettings) => {
     setSettings(next);
-    engineRef.current?.setSettings(next);
+    engineRef.current?.setSettings(next, false);
   }, []);
 
   const onClear = () => {
@@ -252,7 +266,6 @@ export function KaleidoscopeApp() {
     }
   };
 
-  // Keyboard shortcuts
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
@@ -260,7 +273,8 @@ export function KaleidoscopeApp() {
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.key.toLowerCase() === "z") {
         e.preventDefault();
-        onUndo();
+        engineRef.current?.undo();
+        setCanUndo(engineRef.current?.canUndo() ?? false);
         return;
       }
       if (e.key === " " && !mod) {
@@ -270,22 +284,42 @@ export function KaleidoscopeApp() {
       }
       switch (e.key.toLowerCase()) {
         case "f":
-          if (!mod) onFreeze();
+          if (!mod) {
+            setSettings((prev) => {
+              const frozen = !prev.frozen;
+              engineRef.current?.setSettings({ frozen }, false);
+              return { ...prev, frozen };
+            });
+          }
           break;
         case "r":
-          if (!mod) onRandomize();
+          if (!mod) {
+            setSettings((prev) => {
+              const next = randomizeSettings(prev);
+              engineRef.current?.setSettings(next, false);
+              return next;
+            });
+          }
           break;
         case "e":
-          if (!mod) onExport();
+          if (!mod) {
+            const eng = engineRef.current;
+            if (!eng) break;
+            const url = eng.exportPng();
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `kaleidoscope-${Date.now()}.png`;
+            a.click();
+          }
           break;
         case "c":
-          if (!mod) onClear();
+          if (!mod) engineRef.current?.clear(true);
           break;
         case "u":
-          if (!mod) onUndo();
-          break;
-        case "s":
-          if (!mod) onSavePreset();
+          if (!mod) {
+            engineRef.current?.undo();
+            setCanUndo(engineRef.current?.canUndo() ?? false);
+          }
           break;
         default:
           break;
@@ -293,8 +327,7 @@ export function KaleidoscopeApp() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings, presets, demoPlaying]);
+  }, []);
 
   return (
     <div
@@ -303,7 +336,7 @@ export function KaleidoscopeApp() {
     >
       <canvas
         ref={canvasRef}
-        className="absolute inset-0 h-full w-full touch-none"
+        className="absolute inset-0 h-full w-full touch-none will-change-transform"
         aria-label="Kaleidoscope drawing surface"
       />
 
@@ -324,7 +357,6 @@ export function KaleidoscopeApp() {
         }}
       />
 
-      {/* Soft spider watermark — always subtle; stronger in fullscreen */}
       <div
         className={cn(
           "pointer-events-none absolute inset-0 z-[4] flex items-center justify-center transition-opacity duration-700",
@@ -337,6 +369,8 @@ export function KaleidoscopeApp() {
           alt=""
           className="max-h-[55vmin] max-w-[55vmin] object-contain opacity-[0.07] mix-blend-screen select-none"
           draggable={false}
+          decoding="async"
+          loading="lazy"
         />
       </div>
 
@@ -347,6 +381,9 @@ export function KaleidoscopeApp() {
             alt=""
             className="size-8 rounded-md object-cover ring-1 ring-white/10 sm:size-9"
             draggable={false}
+            decoding="async"
+            width={36}
+            height={36}
           />
           <div>
             <h1 className="text-sm font-semibold tracking-tight leading-none">
@@ -427,8 +464,7 @@ export function KaleidoscopeApp() {
           panelOpen ? "translate-y-0" : "translate-y-[calc(100%+1rem)]",
         )}
       >
-        <div className="mx-auto max-w-3xl rounded-xl border border-border bg-panel p-4 shadow-panel backdrop-blur-md sm:p-5 max-h-[min(58dvh,520px)] overflow-y-auto">
-          {/* Seed looks */}
+        <div className="mx-auto max-w-3xl rounded-xl border border-border bg-panel p-4 shadow-panel backdrop-blur-md sm:p-5 max-h-[min(58dvh,520px)] overflow-y-auto overscroll-contain">
           <div className="mb-4">
             <div className="mb-2 flex items-center justify-between gap-2">
               <p className="text-[11px] font-medium uppercase tracking-wider text-subtle">
@@ -521,7 +557,7 @@ export function KaleidoscopeApp() {
 
             <ControlGroup
               label="Axis angle"
-              value={`${Math.round(liveAxisDeg)}°`}
+              value={`${Math.round(liveAxisDeg || settings.axisAngle)}°`}
             >
               <input
                 type="range"
@@ -529,7 +565,11 @@ export function KaleidoscopeApp() {
                 max={360}
                 step={1}
                 value={settings.axisAngle}
-                onChange={(e) => update({ axisAngle: Number(e.target.value) })}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  update({ axisAngle: v });
+                  setLiveAxisDeg(v);
+                }}
                 onPointerDown={() => setShowAxes(true)}
                 onPointerUp={() => setShowAxes(false)}
                 onPointerCancel={() => setShowAxes(false)}
@@ -648,7 +688,10 @@ export function KaleidoscopeApp() {
                       className="inline-flex items-center gap-1 text-xs font-medium text-fg"
                       title="Load preset"
                     >
-                      <Bookmark className="size-3 text-muted" strokeWidth={1.75} />
+                      <Bookmark
+                        className="size-3 text-muted"
+                        strokeWidth={1.75}
+                      />
                       {p.name}
                     </button>
                     <button
@@ -667,7 +710,6 @@ export function KaleidoscopeApp() {
         </div>
       </div>
 
-      {/* Soft WSV credit — corner always; full-bleed feel in fullscreen */}
       <a
         href="https://webbspinnervisions.net"
         target="_blank"
@@ -677,12 +719,15 @@ export function KaleidoscopeApp() {
           "hover:border-white/20 hover:bg-black/50",
           isFullscreen
             ? "bottom-4 left-1/2 -translate-x-1/2 px-4 py-2.5 shadow-panel"
-            : "bottom-3 left-3 px-2.5 py-1.5 sm:bottom-4 sm:left-4",
-          panelOpen && !isFullscreen ? "mb-[min(58dvh,520px)] sm:mb-0" : "",
+            : "left-3 px-2.5 py-1.5 sm:left-4",
         )}
         style={
-          panelOpen && !isFullscreen
-            ? { bottom: "calc(min(58dvh, 520px) + 1.25rem)" }
+          !isFullscreen
+            ? {
+                bottom: panelOpen
+                  ? "calc(min(58dvh, 520px) + 1.25rem)"
+                  : "1rem",
+              }
             : undefined
         }
         onMouseEnter={() => isFullscreen && setCreditSoft(true)}
@@ -695,6 +740,9 @@ export function KaleidoscopeApp() {
             isFullscreen ? "size-9" : "size-7",
           )}
           draggable={false}
+          decoding="async"
+          width={36}
+          height={36}
         />
         <div className="leading-tight">
           <span
@@ -769,7 +817,7 @@ function AxisGuide({
       aria-hidden
     >
       <div
-        className="absolute left-1/2 top-1/2 h-[140vmax] w-[140vmax]"
+        className="absolute left-1/2 top-1/2 h-[140vmax] w-[140vmax] will-change-transform"
         style={{
           transform: `translate(-50%, -50%) rotate(${axisDeg}deg)`,
         }}
