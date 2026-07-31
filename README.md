@@ -3,7 +3,7 @@
 Interactive kaleidoscope — mirror pointer movement into symmetric, colorful patterns.
 
 **Live:** [kaleidoscope.webbspinnervisions.net](https://kaleidoscope.webbspinnervisions.net)  
-**GitHub Pages:** [spiderforce-star.github.io/Kaleidoscope](https://spiderforce-star.github.io/Kaleidoscope/)  
+**GitHub Pages:** [spiderforce-star.github.io/Kaleidoscope](https://kaleidoscope.webbspinnervisions.net/)  
 **Repo:** [github.com/SpiderForce-Star/Kaleidoscope](https://github.com/SpiderForce-Star/Kaleidoscope)
 
 ## Features
