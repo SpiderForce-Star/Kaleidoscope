@@ -1,6 +1,11 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
+/* SPA build roots at spa/; scan app sources so utilities are not purged */
+@source "./**/*.{ts,tsx}";
+@source "../spa/**/*.{ts,tsx}";
+@source "../components/**/*.{ts,tsx}";
+
 @theme {
   --color-bg: #070708;
   --color-surface: #121214;
@@ -35,6 +40,7 @@
 
   html,
   body,
+  #root,
   #app {
     height: 100%;
     margin: 0;
