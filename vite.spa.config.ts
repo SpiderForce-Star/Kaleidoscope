@@ -3,12 +3,17 @@ import viteReact from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "node:path";
 
-// Static SPA build for GitHub Pages (no SSR / Nitro).
-// Live: https://spiderforce-star.github.io/Kaleidoscope/
+// Static SPA for GitHub Pages.
+// Custom domain: https://kaleidoscope.webbspinnervisions.net
+// Project pages fallback: https://spiderforce-star.github.io/Kaleidoscope/
+// BASE_PATH=/ for custom domain (default).
+const base = process.env.BASE_PATH ?? "/";
+
 export default defineConfig({
-  base: "/Kaleidoscope/",
+  base,
   root: path.resolve(__dirname, "spa"),
-  publicDir: false,
+  // CNAME + any static assets from spa/public
+  publicDir: path.resolve(__dirname, "spa/public"),
   plugins: [tailwindcss(), viteReact()],
   resolve: {
     alias: {

@@ -2,7 +2,8 @@
 
 Interactive kaleidoscope — mirror pointer movement into symmetric, colorful patterns.
 
-**Live:** [spiderforce-star.github.io/Kaleidoscope](https://spiderforce-star.github.io/Kaleidoscope/)  
+**Live:** [kaleidoscope.webbspinnervisions.net](https://kaleidoscope.webbspinnervisions.net)  
+**GitHub Pages:** [spiderforce-star.github.io/Kaleidoscope](https://spiderforce-star.github.io/Kaleidoscope/)  
 **Repo:** [github.com/SpiderForce-Star/Kaleidoscope](https://github.com/SpiderForce-Star/Kaleidoscope)
 
 ## Features
@@ -36,17 +37,26 @@ Open [http://localhost:8080](http://localhost:8080).
 | `npm run preview` | Serve production build |
 | `npm run typecheck` | TypeScript check |
 
+## Custom domain
+
+| Host | Type | Value |
+| --- | --- | --- |
+| `kaleidoscope` | `CNAME` | `spiderforce-star.github.io` |
+
+Domain: `kaleidoscope.webbspinnervisions.net`  
+DNS is managed at your registrar (same place as `webbspinnervisions.net`). After the CNAME propagates, GitHub issues HTTPS automatically.
+
+The `CNAME` file on the `gh-pages` branch is set to `kaleidoscope.webbspinnervisions.net`.
+
 ## Deploy
 
 ### GitHub Pages (automatic)
 
-Pushing to `main` runs `.github/workflows/deploy-pages.yml`, which builds the SPA and deploys to GitHub Pages.
-
-Enable once (if needed): **Settings → Pages → Source: GitHub Actions**.
+Pushing to `main` runs `.github/workflows/deploy-pages.yml`, which builds the SPA and deploys to the `gh-pages` branch.
 
 ### Vercel (optional)
 
-[Import this repo on Vercel](https://vercel.com/new/clone?repository-url=https://github.com/SpiderForce-Star/Kaleidoscope) — framework preset uses `npm run build` (Nitro `vercel` output).
+[Import this repo on Vercel](https://vercel.com/new/clone?repository-url=https://github.com/SpiderForce-Star/Kaleidoscope) — uses `npm run build` (Nitro `vercel` output).
 
 ## Stack
 
