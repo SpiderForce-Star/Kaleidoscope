@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
@@ -42,11 +43,18 @@ const SPIDER_SRC = `${import.meta.env.BASE_URL}spider.jpg`.replace(
   "/",
 );
 
+/** Trail mode presets — Hold keeps color forever; Fade is temporary. */
+const TRAIL_PRESETS = [
+  { id: "hold", label: "Hold", value: 0, hint: "Colors stay" },
+  { id: "soft", label: "Soft fade", value: 0.28, hint: "Slow dissolve" },
+  { id: "fast", label: "Fast fade", value: 0.72, hint: "Quick trails" },
+] as const;
+
 function trailLabel(trail: number) {
   if (trail < 0.08) return "Hold";
-  if (trail < 0.35) return "Long";
+  if (trail < 0.35) return "Soft";
   if (trail < 0.65) return "Med";
-  return "Short";
+  return "Fast";
 }
 
 function spinLabel(spin: number) {
@@ -72,25 +80,34 @@ function settingsForPreset(s: KaleidoscopeSettings): KaleidoscopeSettings {
   };
 }
 
+function isMobileStart() {
+  if (typeof window === "undefined") return false;
+  return window.matchMedia("(max-width: 640px)").matches;
+}
+
 export function KaleidoscopeApp() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const engineRef = useRef<KaleidoscopeEngine | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const [settings, setSettings] =
     useState<KaleidoscopeSettings>(DEFAULT_SETTINGS);
-  const [panelOpen, setPanelOpen] = useState(true);
+  // Start closed on phones so the canvas is drawable immediately
+  const [panelOpen, setPanelOpen] = useState(() => !isMobileStart());
   const [toast, setToast] = useState<string | null>(null);
-  const [hint, setHint] = useState(true);
+  const [hint, setHint] = useState(false);
   const [showAxes, setShowAxes] = useState(false);
   const [liveAxisDeg, setLiveAxisDeg] = useState(0);
   const [canUndo, setCanUndo] = useState(false);
   const [presets, setPresets] = useState<UserPreset[]>([]);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [creditSoft, setCreditSoft] = useState(true);
   const [demoPlaying, setDemoPlaying] = useState(false);
+  /** Intro WSV credit — few seconds on open only */
+  const [intro, setIntro] = useState(true);
+  const [introOut, setIntroOut] = useState(false);
   const axisSpinRef = useRef(0);
   const showAxesRef = useRef(false);
   const lastAxisUi = useRef(0);
+  const trailHold = settings.trail < 0.08;
 
   const pushToast = useCallback((msg: string) => {
     setToast(msg);
@@ -111,16 +128,38 @@ export function KaleidoscopeApp() {
     engineRef.current = engine;
     engine.mount();
     setPresets(loadPresets());
+
+    // Hide panel when user starts painting (more canvas, fewer finger fights)
+    const hidePanel = () => {
+      if (isMobileStart()) setPanelOpen(false);
+      setHint(false);
+    };
+    canvas.addEventListener("pointerdown", hidePanel);
     return () => {
+      canvas.removeEventListener("pointerdown", hidePanel);
       engine.unmount();
       engineRef.current = null;
     };
   }, []);
 
+  // Intro credit: show ~2.8s then fade out
   useEffect(() => {
-    const t = window.setTimeout(() => setHint(false), 5000);
-    return () => clearTimeout(t);
+    const fadeAt = window.setTimeout(() => setIntroOut(true), 2600);
+    const doneAt = window.setTimeout(() => {
+      setIntro(false);
+      setHint(true);
+    }, 3400);
+    return () => {
+      clearTimeout(fadeAt);
+      clearTimeout(doneAt);
+    };
   }, []);
+
+  useEffect(() => {
+    if (!hint) return;
+    const t = window.setTimeout(() => setHint(false), 4500);
+    return () => clearTimeout(t);
+  }, [hint]);
 
   useEffect(() => {
     axisSpinRef.current = settings.axisSpin;
@@ -130,19 +169,17 @@ export function KaleidoscopeApp() {
     showAxesRef.current = showAxes;
   }, [showAxes]);
 
-  // Axis angle UI — only when needed, throttled (~12 Hz)
+  // Axis / view rotation UI — when spinning or hold-view
   useEffect(() => {
     let raf = 0;
     let lastPub = 0;
     const tick = (now: number) => {
       const eng = engineRef.current;
-      const need =
-        showAxesRef.current ||
-        axisSpinRef.current > 0 ||
-        (eng?.getSettings().axisSpin ?? 0) > 0;
-      if (eng && need && now - lastPub > 80) {
+      const spinning = (eng?.getSettings().axisSpin ?? 0) > 0;
+      const need = showAxesRef.current || spinning || trailHold;
+      if (eng && need && now - lastPub > 50) {
         const deg = eng.getEffectiveAxisDeg();
-        if (Math.abs(deg - lastAxisUi.current) >= 0.4) {
+        if (Math.abs(deg - lastAxisUi.current) >= 0.25) {
           lastAxisUi.current = deg;
           setLiveAxisDeg(deg);
           lastPub = now;
@@ -152,7 +189,7 @@ export function KaleidoscopeApp() {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, []);
+  }, [trailHold]);
 
   useEffect(() => {
     const onFs = () => setIsFullscreen(Boolean(document.fullscreenElement));
@@ -182,28 +219,31 @@ export function KaleidoscopeApp() {
   const onUndo = () => {
     const ok = engineRef.current?.undo();
     syncEngineFlags();
-    if (ok) pushToast("Undone");
-    else pushToast("Nothing to undo");
+    pushToast(ok ? "Undone" : "Nothing to undo");
   };
 
   const onRandomize = () => {
-    const next = randomizeSettings(settings);
-    applyFullSettings(next);
+    applyFullSettings(randomizeSettings(settings));
     pushToast("Look randomized");
   };
 
   const onFreeze = () => {
     const frozen = !settings.frozen;
     update({ frozen });
-    pushToast(frozen ? "Frame frozen" : "Live again");
+    pushToast(
+      frozen
+        ? trailHold
+          ? "Held — spin still runs"
+          : "Frame frozen"
+        : "Live again",
+    );
   };
 
   const onExport = () => {
     const engine = engineRef.current;
     if (!engine) return;
-    const url = engine.exportPng();
     const a = document.createElement("a");
-    a.href = url;
+    a.href = engine.exportPng();
     a.download = `kaleidoscope-${Date.now()}.png`;
     a.click();
     pushToast("Image exported");
@@ -214,6 +254,7 @@ export function KaleidoscopeApp() {
     if (!eng || demoPlaying) return;
     setDemoPlaying(true);
     setHint(false);
+    if (isMobileStart()) setPanelOpen(false);
     try {
       await eng.playSeed(seed);
       applyFullSettings({ ...seed.settings, frozen: false });
@@ -255,15 +296,18 @@ export function KaleidoscopeApp() {
     const el = rootRef.current;
     if (!el) return;
     try {
-      if (!document.fullscreenElement) {
-        await el.requestFullscreen();
-        setCreditSoft(true);
-      } else {
-        await document.exitFullscreen();
-      }
+      if (!document.fullscreenElement) await el.requestFullscreen();
+      else await document.exitFullscreen();
     } catch {
       pushToast("Fullscreen not available");
     }
+  };
+
+  const setTrailMode = (value: number) => {
+    update({ trail: value });
+    if (value < 0.08) pushToast("Hold — colors stay forever");
+    else if (value > 0.5) pushToast("Fast fade");
+    else pushToast("Soft fade");
   };
 
   useEffect(() => {
@@ -280,54 +324,29 @@ export function KaleidoscopeApp() {
       if (e.key === " " && !mod) {
         e.preventDefault();
         setPanelOpen((v) => !v);
-        return;
-      }
-      switch (e.key.toLowerCase()) {
-        case "f":
-          if (!mod) {
-            setSettings((prev) => {
-              const frozen = !prev.frozen;
-              engineRef.current?.setSettings({ frozen }, false);
-              return { ...prev, frozen };
-            });
-          }
-          break;
-        case "r":
-          if (!mod) {
-            setSettings((prev) => {
-              const next = randomizeSettings(prev);
-              engineRef.current?.setSettings(next, false);
-              return next;
-            });
-          }
-          break;
-        case "e":
-          if (!mod) {
-            const eng = engineRef.current;
-            if (!eng) break;
-            const url = eng.exportPng();
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = `kaleidoscope-${Date.now()}.png`;
-            a.click();
-          }
-          break;
-        case "c":
-          if (!mod) engineRef.current?.clear(true);
-          break;
-        case "u":
-          if (!mod) {
-            engineRef.current?.undo();
-            setCanUndo(engineRef.current?.canUndo() ?? false);
-          }
-          break;
-        default:
-          break;
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  // Hold + spin + freeze → rotate whole canvas (presentation mode).
+  // Only while frozen so pointer coords stay correct while painting.
+  const canvasSpinStyle = useMemo(() => {
+    if (!trailHold || settings.axisSpin <= 0 || !settings.frozen) return undefined;
+    return {
+      transform: `rotate(${liveAxisDeg}deg) scale(1.22)`,
+      transformOrigin: "center center",
+    } as const;
+  }, [trailHold, settings.axisSpin, settings.frozen, liveAxisDeg]);
+
+  const activeTrailPreset = TRAIL_PRESETS.find((p) =>
+    p.id === "hold"
+      ? settings.trail < 0.08
+      : p.id === "soft"
+        ? settings.trail >= 0.08 && settings.trail < 0.5
+        : settings.trail >= 0.5,
+  )?.id;
 
   return (
     <div
@@ -337,10 +356,11 @@ export function KaleidoscopeApp() {
       <canvas
         ref={canvasRef}
         className="absolute inset-0 h-full w-full touch-none will-change-transform"
+        style={canvasSpinStyle}
         aria-label="Kaleidoscope drawing surface"
       />
 
-      {(showAxes || settings.axisSpin > 0) && (
+      {(showAxes || settings.axisSpin > 0) && !trailHold && (
         <AxisGuide
           segments={settings.segments}
           axisDeg={liveAxisDeg}
@@ -353,118 +373,170 @@ export function KaleidoscopeApp() {
         className="pointer-events-none absolute inset-0"
         style={{
           background:
-            "radial-gradient(ellipse at center, transparent 42%, rgba(7,7,8,0.5) 100%)",
+            "radial-gradient(ellipse at center, transparent 42%, rgba(7,7,8,0.45) 100%)",
         }}
       />
 
-      <div
-        className={cn(
-          "pointer-events-none absolute inset-0 z-[4] flex items-center justify-center transition-opacity duration-700",
-          isFullscreen && creditSoft ? "opacity-100" : "opacity-0",
-        )}
-        aria-hidden
-      >
-        <img
-          src={SPIDER_SRC}
-          alt=""
-          className="max-h-[55vmin] max-w-[55vmin] object-contain opacity-[0.07] mix-blend-screen select-none"
-          draggable={false}
-          decoding="async"
-          loading="lazy"
-        />
-      </div>
-
-      <header className="pointer-events-none absolute inset-x-0 top-0 z-20 flex items-start justify-between gap-3 p-3 sm:p-4">
-        <div className="pointer-events-auto flex items-center gap-2.5 rounded-xl border border-border bg-panel px-3 py-2 shadow-panel backdrop-blur-md sm:px-3.5 sm:py-2.5">
+      {/* Compact top bar — icon-first, fat-finger targets */}
+      <header className="pointer-events-none absolute inset-x-0 top-0 z-20 flex items-start justify-between gap-2 p-2 sm:p-3 safe-top">
+        <div className="pointer-events-auto flex items-center gap-2 rounded-2xl border border-border bg-panel/95 px-2.5 py-2 shadow-panel backdrop-blur-md">
           <img
             src={SPIDER_SRC}
             alt=""
-            className="size-8 rounded-md object-cover ring-1 ring-white/10 sm:size-9"
+            className="size-9 rounded-lg object-cover ring-1 ring-white/10"
             draggable={false}
             decoding="async"
             width={36}
             height={36}
           />
-          <div>
+          <div className="hidden min-[400px]:block pr-1">
             <h1 className="text-sm font-semibold tracking-tight leading-none">
               Kaleidoscope
             </h1>
-            <p className="mt-0.5 text-[11px] text-muted leading-none">
-              Draw · mirror · export
+            <p className="mt-0.5 text-[10px] text-muted leading-none">
+              WSV
             </p>
           </div>
         </div>
 
-        <div className="pointer-events-auto flex flex-wrap items-center justify-end gap-2">
+        <div className="pointer-events-auto flex flex-wrap items-center justify-end gap-1.5 sm:gap-2 max-w-[70%]">
           <ActionButton
             onClick={onUndo}
             label="Undo"
             disabled={!canUndo}
-            icon={<Undo2 className="size-4" strokeWidth={1.75} />}
+            icon={<Undo2 className="size-5" strokeWidth={1.75} />}
           />
           <ActionButton
             active={settings.frozen}
             onClick={onFreeze}
-            label={settings.frozen ? "Unfreeze" : "Freeze"}
-            icon={<Snowflake className="size-4" strokeWidth={1.75} />}
+            label={settings.frozen ? "Unfreeze" : "Hold frame"}
+            icon={<Snowflake className="size-5" strokeWidth={1.75} />}
           />
           <ActionButton
             onClick={onRandomize}
-            label="Randomize"
-            icon={<Shuffle className="size-4" strokeWidth={1.75} />}
+            label="Random"
+            icon={<Shuffle className="size-5" strokeWidth={1.75} />}
           />
           <ActionButton
             onClick={onExport}
             label="Export"
-            icon={<Download className="size-4" strokeWidth={1.75} />}
+            icon={<Download className="size-5" strokeWidth={1.75} />}
           />
           <ActionButton
             onClick={onClear}
             label="Clear"
-            icon={<Trash2 className="size-4" strokeWidth={1.75} />}
+            icon={<Trash2 className="size-5" strokeWidth={1.75} />}
           />
           <ActionButton
             onClick={toggleFullscreen}
-            label={isFullscreen ? "Exit" : "Fullscreen"}
+            label={isFullscreen ? "Exit" : "Full"}
             icon={
               isFullscreen ? (
-                <Minimize2 className="size-4" strokeWidth={1.75} />
+                <Minimize2 className="size-5" strokeWidth={1.75} />
               ) : (
-                <Maximize2 className="size-4" strokeWidth={1.75} />
+                <Maximize2 className="size-5" strokeWidth={1.75} />
               )
             }
           />
           <ActionButton
             active={panelOpen}
             onClick={() => setPanelOpen((v) => !v)}
-            label={panelOpen ? "Hide" : "Controls"}
+            label={panelOpen ? "Close" : "Menu"}
             icon={
               panelOpen ? (
-                <X className="size-4" strokeWidth={1.75} />
+                <X className="size-5" strokeWidth={1.75} />
               ) : (
-                <SlidersHorizontal className="size-4" strokeWidth={1.75} />
+                <SlidersHorizontal className="size-5" strokeWidth={1.75} />
               )
             }
           />
         </div>
       </header>
 
-      {hint && (
-        <div className="pointer-events-none absolute left-1/2 top-[38%] z-10 -translate-x-1/2 -translate-y-1/2 text-center px-4">
-          <p className="rounded-xl border border-border bg-panel px-5 py-3 text-sm text-muted shadow-panel backdrop-blur-md">
-            Drag to paint · tap a seed look below ·{" "}
-            <span className="text-fg/80">U</span> undo
+      {hint && !intro && (
+        <div className="pointer-events-none absolute left-1/2 top-[36%] z-10 -translate-x-1/2 -translate-y-1/2 text-center px-4">
+          <p className="rounded-2xl border border-border bg-panel px-5 py-3.5 text-sm text-muted shadow-panel backdrop-blur-md max-w-xs">
+            Drag to paint. Open <span className="text-fg">Menu</span> for Hold /
+            Fade & spin.
           </p>
         </div>
       )}
 
+      {/* Floating Menu FAB when panel closed — easy thumb reach */}
+      {!panelOpen && (
+        <button
+          type="button"
+          onClick={() => setPanelOpen(true)}
+          className="absolute bottom-5 right-4 z-20 flex h-14 w-14 items-center justify-center rounded-full border border-border bg-panel text-fg shadow-panel backdrop-blur-md active:scale-95 sm:bottom-6 sm:right-6"
+          aria-label="Open controls"
+        >
+          <SlidersHorizontal className="size-6" strokeWidth={1.75} />
+        </button>
+      )}
+
       <div
         className={cn(
-          "absolute inset-x-0 bottom-0 z-20 p-3 sm:p-4 transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]",
-          panelOpen ? "translate-y-0" : "translate-y-[calc(100%+1rem)]",
+          "absolute inset-x-0 bottom-0 z-20 transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]",
+          panelOpen ? "translate-y-0" : "translate-y-[110%]",
         )}
       >
-        <div className="mx-auto max-w-3xl rounded-xl border border-border bg-panel p-4 shadow-panel backdrop-blur-md sm:p-5 max-h-[min(58dvh,520px)] overflow-y-auto overscroll-contain">
+        <div className="mx-auto max-w-lg rounded-t-2xl border border-border border-b-0 bg-panel/95 p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-panel backdrop-blur-md sm:max-w-xl sm:rounded-2xl sm:border-b sm:mb-3 sm:mx-3 sm:p-5 max-h-[min(52dvh,480px)] overflow-y-auto overscroll-contain">
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <p className="text-xs font-semibold tracking-wide text-fg">
+              Controls
+            </p>
+            <button
+              type="button"
+              onClick={() => setPanelOpen(false)}
+              className="flex h-11 w-11 items-center justify-center rounded-full border border-border bg-surface text-muted active:bg-surface-raised"
+              aria-label="Close controls"
+            >
+              <X className="size-5" strokeWidth={1.75} />
+            </button>
+          </div>
+
+          {/* Hold / Fade — primary for constant vs temporary color */}
+          <div className="mb-4">
+            <p className="mb-2 text-[11px] font-medium uppercase tracking-wider text-subtle">
+              Color life
+            </p>
+            <div className="grid grid-cols-3 gap-2">
+              {TRAIL_PRESETS.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  onClick={() => setTrailMode(p.value)}
+                  className={cn(
+                    "min-h-12 rounded-xl border px-2 py-2.5 text-center transition-colors",
+                    activeTrailPreset === p.id
+                      ? "border-accent bg-accent text-accent-fg"
+                      : "border-border bg-surface text-muted active:bg-surface-raised",
+                  )}
+                >
+                  <span className="block text-xs font-semibold">{p.label}</span>
+                  <span
+                    className={cn(
+                      "mt-0.5 block text-[10px]",
+                      activeTrailPreset === p.id
+                        ? "text-accent-fg/80"
+                        : "text-subtle",
+                    )}
+                  >
+                    {p.hint}
+                  </span>
+                </button>
+              ))}
+            </div>
+            {trailHold && (
+              <p className="mt-2 text-[11px] text-muted leading-snug">
+                Hold keeps colors forever. Add Spin, paint, then tap{" "}
+                <span className="text-fg/90">Hold frame</span> — the view spins
+                for a constant show. Soft / Fast fade for temporary trails.
+              </p>
+            )}
+          </div>
+
+          {/* Seeds — larger chips */}
           <div className="mb-4">
             <div className="mb-2 flex items-center justify-between gap-2">
               <p className="text-[11px] font-medium uppercase tracking-wider text-subtle">
@@ -472,11 +544,11 @@ export function KaleidoscopeApp() {
               </p>
               {demoPlaying && (
                 <span className="text-[11px] text-muted animate-pulse">
-                  Playing demo…
+                  Playing…
                 </span>
               )}
             </div>
-            <div className="flex gap-2 overflow-x-auto pb-1 -mx-0.5 px-0.5">
+            <div className="flex gap-2 overflow-x-auto pb-1 -mx-0.5 px-0.5 snap-x">
               {SEED_LOOKS.map((seed) => (
                 <button
                   key={seed.id}
@@ -484,15 +556,14 @@ export function KaleidoscopeApp() {
                   disabled={demoPlaying}
                   onClick={() => onSeed(seed)}
                   className={cn(
-                    "shrink-0 rounded-lg border border-border bg-surface px-3 py-2 text-left transition-colors duration-150",
-                    "hover:border-border-strong hover:bg-surface-raised",
-                    "disabled:opacity-50 min-w-[5.5rem]",
+                    "snap-start shrink-0 min-h-14 min-w-[5.75rem] rounded-xl border border-border bg-surface px-3 py-2.5 text-left",
+                    "active:bg-surface-raised disabled:opacity-50",
                   )}
                 >
-                  <span className="block text-xs font-semibold text-fg">
+                  <span className="block text-sm font-semibold text-fg">
                     {seed.name}
                   </span>
-                  <span className="mt-0.5 block text-[10px] text-muted leading-snug">
+                  <span className="mt-0.5 block text-[11px] text-muted leading-snug">
                     {seed.blurb}
                   </span>
                 </button>
@@ -500,7 +571,7 @@ export function KaleidoscopeApp() {
             </div>
           </div>
 
-          <div className="grid gap-4 sm:grid-cols-2">
+          <div className="grid gap-5 sm:grid-cols-2">
             <ControlGroup label="Segments" value={String(settings.segments)}>
               <input
                 type="range"
@@ -519,8 +590,8 @@ export function KaleidoscopeApp() {
             >
               <input
                 type="range"
-                min={4}
-                max={56}
+                min={8}
+                max={64}
                 step={1}
                 value={settings.brushSize}
                 onChange={(e) => update({ brushSize: Number(e.target.value) })}
@@ -528,7 +599,10 @@ export function KaleidoscopeApp() {
               />
             </ControlGroup>
 
-            <ControlGroup label="Trail" value={trailLabel(settings.trail)}>
+            <ControlGroup
+              label="Fade amount"
+              value={trailLabel(settings.trail)}
+            >
               <input
                 type="range"
                 min={0}
@@ -536,7 +610,7 @@ export function KaleidoscopeApp() {
                 step={0.01}
                 value={settings.trail}
                 onChange={(e) => update({ trail: Number(e.target.value) })}
-                aria-label="Trail fade"
+                aria-label="Trail fade amount"
               />
             </ControlGroup>
 
@@ -578,7 +652,7 @@ export function KaleidoscopeApp() {
             </ControlGroup>
 
             <ControlGroup
-              label="Axis spin"
+              label="Spin (hold + spin = show)"
               value={
                 settings.axisSpin === 0
                   ? "Off"
@@ -599,7 +673,7 @@ export function KaleidoscopeApp() {
                 onPointerCancel={() => {
                   if (axisSpinRef.current === 0) setShowAxes(false);
                 }}
-                aria-label="Symmetry axis spin"
+                aria-label="Spin speed"
               />
             </ControlGroup>
           </div>
@@ -608,17 +682,17 @@ export function KaleidoscopeApp() {
             <p className="mb-2 text-[11px] font-medium uppercase tracking-wider text-subtle">
               Color mode
             </p>
-            <div className="flex flex-wrap gap-1.5">
+            <div className="flex flex-wrap gap-2">
               {COLOR_MODES.map((mode) => (
                 <button
                   key={mode.id}
                   type="button"
                   onClick={() => update({ colorMode: mode.id as ColorMode })}
                   className={cn(
-                    "rounded-pill border px-3 py-1.5 text-xs font-medium transition-colors duration-150",
+                    "min-h-11 rounded-pill border px-4 py-2 text-sm font-medium",
                     settings.colorMode === mode.id
                       ? "border-accent bg-accent text-accent-fg"
-                      : "border-border bg-surface text-muted hover:border-border-strong hover:text-fg",
+                      : "border-border bg-surface text-muted active:bg-surface-raised",
                   )}
                 >
                   {mode.label}
@@ -631,31 +705,31 @@ export function KaleidoscopeApp() {
             <ToggleChip
               active={settings.mirror}
               onClick={() => update({ mirror: !settings.mirror })}
-              icon={<FlipHorizontal2 className="size-3.5" strokeWidth={1.75} />}
+              icon={<FlipHorizontal2 className="size-4" strokeWidth={1.75} />}
               label="Mirror"
             />
             <ToggleChip
               active={settings.glow}
               onClick={() => update({ glow: !settings.glow })}
-              icon={<SunMedium className="size-3.5" strokeWidth={1.75} />}
+              icon={<SunMedium className="size-4" strokeWidth={1.75} />}
               label="Glow"
             />
             <ToggleChip
               active={showAxes || settings.axisSpin > 0}
               onClick={() => setShowAxes((v) => !v)}
-              icon={<RotateCw className="size-3.5" strokeWidth={1.75} />}
+              icon={<RotateCw className="size-4" strokeWidth={1.75} />}
               label="Axes"
             />
             <button
               type="button"
               onClick={onSavePreset}
-              className="inline-flex h-9 items-center gap-1.5 rounded-pill border border-border bg-surface px-3 text-xs font-medium text-muted transition-colors hover:text-fg"
+              className="inline-flex min-h-11 items-center gap-1.5 rounded-pill border border-border bg-surface px-4 text-sm font-medium text-muted active:bg-surface-raised"
             >
-              <BookmarkPlus className="size-3.5" strokeWidth={1.75} />
+              <BookmarkPlus className="size-4" strokeWidth={1.75} />
               Save preset
             </button>
             {settings.colorMode === "mono" && (
-              <div className="flex min-w-[140px] flex-1 items-center gap-2 rounded-pill border border-border bg-surface px-3 py-1.5">
+              <div className="flex min-h-11 min-w-[160px] flex-1 items-center gap-2 rounded-pill border border-border bg-surface px-3">
                 <span className="text-xs text-muted">Tone</span>
                 <input
                   type="range"
@@ -676,20 +750,19 @@ export function KaleidoscopeApp() {
               <p className="mb-2 text-[11px] font-medium uppercase tracking-wider text-subtle">
                 Your presets
               </p>
-              <div className="flex flex-wrap gap-1.5">
+              <div className="flex flex-wrap gap-2">
                 {presets.map((p) => (
                   <div
                     key={p.id}
-                    className="inline-flex items-center gap-1 rounded-pill border border-border bg-surface pl-2.5 pr-1 py-1"
+                    className="inline-flex min-h-11 items-center gap-1 rounded-pill border border-border bg-surface pl-3 pr-1"
                   >
                     <button
                       type="button"
                       onClick={() => onLoadPreset(p)}
-                      className="inline-flex items-center gap-1 text-xs font-medium text-fg"
-                      title="Load preset"
+                      className="inline-flex items-center gap-1.5 py-2 text-sm font-medium text-fg"
                     >
                       <Bookmark
-                        className="size-3 text-muted"
+                        className="size-3.5 text-muted"
                         strokeWidth={1.75}
                       />
                       {p.name}
@@ -697,10 +770,10 @@ export function KaleidoscopeApp() {
                     <button
                       type="button"
                       onClick={() => onDeletePreset(p.id)}
-                      className="rounded-full p-1 text-muted hover:text-fg"
+                      className="flex h-10 w-10 items-center justify-center rounded-full text-muted active:bg-surface-raised"
                       aria-label={`Delete ${p.name}`}
                     >
-                      <X className="size-3" strokeWidth={2} />
+                      <X className="size-4" strokeWidth={2} />
                     </button>
                   </div>
                 ))}
@@ -710,85 +783,46 @@ export function KaleidoscopeApp() {
         </div>
       </div>
 
-      <a
-        href="https://webbspinnervisions.net"
-        target="_blank"
-        rel="noopener noreferrer"
-        className={cn(
-          "absolute z-20 flex items-center gap-2 rounded-xl border border-white/10 bg-black/35 backdrop-blur-md transition-all duration-500",
-          "hover:border-white/20 hover:bg-black/50",
-          isFullscreen
-            ? "bottom-4 left-1/2 -translate-x-1/2 px-4 py-2.5 shadow-panel"
-            : "left-3 px-2.5 py-1.5 sm:left-4",
-        )}
-        style={
-          !isFullscreen
-            ? {
-                bottom: panelOpen
-                  ? "calc(min(58dvh, 520px) + 1.25rem)"
-                  : "1rem",
-              }
-            : undefined
-        }
-        onMouseEnter={() => isFullscreen && setCreditSoft(true)}
-      >
-        <img
-          src={SPIDER_SRC}
-          alt=""
+      {/* Intro WSV credit — few seconds only */}
+      {intro && (
+        <div
           className={cn(
-            "rounded-md object-cover ring-1 ring-white/15",
-            isFullscreen ? "size-9" : "size-7",
+            "absolute inset-0 z-40 flex flex-col items-center justify-center bg-bg/92 backdrop-blur-sm transition-opacity duration-700",
+            introOut ? "opacity-0 pointer-events-none" : "opacity-100",
           )}
-          draggable={false}
-          decoding="async"
-          width={36}
-          height={36}
-        />
-        <div className="leading-tight">
-          <span
-            className={cn(
-              "block font-semibold tracking-wide text-fg/90",
-              isFullscreen ? "text-xs" : "text-[10px]",
-            )}
-          >
-            Webb Spinner Visions
-          </span>
-          <span className="block text-[10px] text-muted">
-            Nashville · webbspinnervisions.net
-          </span>
-        </div>
-        <Sparkles
-          className={cn(
-            "text-accent/70",
-            isFullscreen ? "size-4" : "size-3.5",
-          )}
-          strokeWidth={1.5}
-        />
-      </a>
-
-      {isFullscreen && (
-        <button
-          type="button"
-          onClick={() => setCreditSoft((v) => !v)}
-          className="absolute right-4 bottom-4 z-20 rounded-pill border border-border bg-panel/80 px-3 py-1.5 text-[10px] text-muted backdrop-blur-md hover:text-fg"
+          aria-hidden={introOut}
         >
-          {creditSoft ? "Hide spider" : "Show spider"}
-        </button>
+          <img
+            src={SPIDER_SRC}
+            alt=""
+            className="mb-5 size-28 rounded-2xl object-cover ring-1 ring-white/15 shadow-panel sm:size-32"
+            draggable={false}
+            decoding="async"
+          />
+          <p className="text-lg font-semibold tracking-wide text-fg sm:text-xl">
+            Webb Spinner Visions
+          </p>
+          <p className="mt-1.5 text-sm text-muted">Kaleidoscope</p>
+          <p className="mt-4 flex items-center gap-1.5 text-xs text-subtle">
+            <Sparkles className="size-3.5" strokeWidth={1.5} />
+            Nashville
+          </p>
+        </div>
       )}
 
       {toast && (
-        <div className="pointer-events-none absolute left-1/2 top-20 z-30 -translate-x-1/2">
-          <div className="rounded-pill border border-border bg-surface-raised px-4 py-2 text-xs font-medium text-fg shadow-panel">
+        <div className="pointer-events-none absolute left-1/2 top-[4.75rem] z-30 -translate-x-1/2 px-3">
+          <div className="rounded-pill border border-border bg-surface-raised px-4 py-2.5 text-sm font-medium text-fg shadow-panel">
             {toast}
           </div>
         </div>
       )}
 
       {settings.frozen && (
-        <div className="pointer-events-none absolute right-3 top-20 z-10 sm:right-4">
-          <div className="flex items-center gap-1.5 rounded-pill border border-border bg-panel px-3 py-1.5 text-xs text-muted shadow-panel backdrop-blur-md">
+        <div className="pointer-events-none absolute left-3 top-[4.75rem] z-10 sm:left-4">
+          <div className="flex items-center gap-1.5 rounded-pill border border-border bg-panel px-3 py-2 text-xs text-muted shadow-panel backdrop-blur-md">
             <Snowflake className="size-3.5" strokeWidth={1.75} />
-            Frozen
+            {trailHold ? "Held · spin on" : "Frozen"}
           </div>
         </div>
       )}
@@ -835,12 +869,6 @@ function AxisGuide({
           />
         ))}
       </div>
-      <div
-        className={cn(
-          "absolute left-1/2 top-1/2 size-2 -translate-x-1/2 -translate-y-1/2 rounded-full",
-          subtle ? "bg-accent/30" : "bg-accent/70",
-        )}
-      />
     </div>
   );
 }
@@ -864,16 +892,16 @@ function ActionButton({
       onClick={onClick}
       disabled={disabled}
       className={cn(
-        "inline-flex h-10 items-center gap-1.5 rounded-md border px-3 text-xs font-medium transition-colors duration-150 active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none",
+        "inline-flex h-12 min-w-12 items-center justify-center gap-1.5 rounded-xl border px-3 text-xs font-medium transition-colors active:scale-[0.97] disabled:opacity-40 disabled:pointer-events-none",
         active
           ? "border-accent bg-accent text-accent-fg"
-          : "border-border bg-panel text-fg shadow-panel backdrop-blur-md hover:border-border-strong",
+          : "border-border bg-panel/95 text-fg shadow-panel backdrop-blur-md",
       )}
       aria-label={label}
       title={label}
     >
       {icon}
-      <span className="hidden sm:inline">{label}</span>
+      <span className="hidden lg:inline">{label}</span>
     </button>
   );
 }
@@ -889,7 +917,7 @@ function ControlGroup({
 }) {
   return (
     <div>
-      <div className="mb-2 flex items-baseline justify-between gap-2">
+      <div className="mb-1 flex items-baseline justify-between gap-2">
         <label className="text-[11px] font-medium uppercase tracking-wider text-subtle">
           {label}
         </label>
@@ -916,10 +944,10 @@ function ToggleChip({
       type="button"
       onClick={onClick}
       className={cn(
-        "inline-flex h-9 items-center gap-1.5 rounded-pill border px-3 text-xs font-medium transition-colors duration-150",
+        "inline-flex min-h-11 items-center gap-1.5 rounded-pill border px-4 text-sm font-medium",
         active
           ? "border-accent bg-accent text-accent-fg"
-          : "border-border bg-surface text-muted hover:text-fg",
+          : "border-border bg-surface text-muted active:bg-surface-raised",
       )}
     >
       {icon}

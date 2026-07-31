@@ -359,7 +359,6 @@ export class KaleidoscopeEngine {
   private axisCacheDeg = Number.NaN;
   private resizeTimer = 0;
   private trailAcc = 0;
-  private needsComposite = false;
   private glowMode = true;
 
   constructor(
@@ -888,21 +887,19 @@ export class KaleidoscopeEngine {
     this.prevFrame = now;
 
     const s = this.settings;
+
+    // Axis spin always runs (even when frozen) so held art can keep spinning for view
+    if (s.axisSpin !== 0) {
+      this.spinAccum = (this.spinAccum + s.axisSpin * dt) % 360;
+      this.axisCacheDeg = Number.NaN;
+    }
+
     if (s.frozen) {
-      // Still advance hue clock lightly for when unfrozen
       this.autoHue += dt * 0.2;
       return;
     }
 
-    let work = false;
-
-    if (s.axisSpin !== 0) {
-      this.spinAccum = (this.spinAccum + s.axisSpin * dt) % 360;
-      this.axisCacheDeg = Number.NaN;
-      work = true;
-    }
-
-    // Trail fade — batch into ~30fps updates when idle
+    // Trail fade — only when not holding; batch ~30fps
     const trail = s.trail;
     if (trail > 0.001 && this.hasContent && !this.drawing) {
       this.trailAcc += dt;
@@ -917,13 +914,11 @@ export class KaleidoscopeEngine {
         this.ctx.fillRect(0, 0, this.w, this.h);
         this.ctx.restore();
         this.trailAcc = 0;
-        work = true;
       }
     } else {
       this.trailAcc = 0;
     }
 
     this.autoHue += dt;
-    this.needsComposite = work;
   };
 }
