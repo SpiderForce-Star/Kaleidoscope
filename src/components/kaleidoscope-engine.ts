@@ -49,6 +49,166 @@ export const DEFAULT_SETTINGS: KaleidoscopeSettings = {
   axisSpin: 0,
 };
 
+/** One-tap seed looks — settings + demo stroke style */
+export type DemoPath = "spiral" | "burst" | "orbit" | "ribbon" | "web";
+
+export interface SeedLook {
+  id: string;
+  name: string;
+  blurb: string;
+  settings: KaleidoscopeSettings;
+  demo: DemoPath;
+}
+
+export const SEED_LOOKS: SeedLook[] = [
+  {
+    id: "prism",
+    name: "Prism",
+    blurb: "Classic rainbow folds",
+    settings: {
+      ...DEFAULT_SETTINGS,
+      segments: 8,
+      colorMode: "rainbow",
+      brushSize: 22,
+      trail: 0.08,
+      mirror: true,
+      glow: true,
+      hueShift: 40,
+      axisSpin: 0,
+      axisAngle: 0,
+      frozen: false,
+    },
+    demo: "spiral",
+  },
+  {
+    id: "venom",
+    name: "Venom",
+    blurb: "Neon red spin",
+    settings: {
+      ...DEFAULT_SETTINGS,
+      segments: 6,
+      colorMode: "neon",
+      brushSize: 18,
+      trail: 0.22,
+      mirror: true,
+      glow: true,
+      hueShift: 330,
+      monoHue: 0,
+      axisSpin: 18,
+      axisAngle: 12,
+      frozen: false,
+    },
+    demo: "web",
+  },
+  {
+    id: "forge",
+    name: "Forge",
+    blurb: "Hot fire bloom",
+    settings: {
+      ...DEFAULT_SETTINGS,
+      segments: 10,
+      colorMode: "fire",
+      brushSize: 28,
+      trail: 0.4,
+      mirror: true,
+      glow: true,
+      hueShift: 0,
+      axisSpin: 6,
+      axisAngle: 0,
+      frozen: false,
+    },
+    demo: "burst",
+  },
+  {
+    id: "glacier",
+    name: "Glacier",
+    blurb: "Cool ice trails",
+    settings: {
+      ...DEFAULT_SETTINGS,
+      segments: 12,
+      colorMode: "ice",
+      brushSize: 16,
+      trail: 0.28,
+      mirror: true,
+      glow: true,
+      hueShift: 20,
+      axisSpin: 0,
+      axisAngle: 15,
+      frozen: false,
+    },
+    demo: "orbit",
+  },
+  {
+    id: "aurora",
+    name: "Aurora",
+    blurb: "Northern glow",
+    settings: {
+      ...DEFAULT_SETTINGS,
+      segments: 7,
+      colorMode: "aurora",
+      brushSize: 24,
+      trail: 0.18,
+      mirror: true,
+      glow: true,
+      hueShift: 80,
+      axisSpin: 10,
+      axisAngle: 0,
+      frozen: false,
+    },
+    demo: "ribbon",
+  },
+  {
+    id: "chrome",
+    name: "Chrome",
+    blurb: "Mono steel",
+    settings: {
+      ...DEFAULT_SETTINGS,
+      segments: 8,
+      colorMode: "mono",
+      brushSize: 20,
+      trail: 0.12,
+      mirror: true,
+      glow: false,
+      hueShift: 0,
+      monoHue: 210,
+      axisSpin: 0,
+      axisAngle: 0,
+      frozen: false,
+    },
+    demo: "spiral",
+  },
+];
+
+export interface UserPreset {
+  id: string;
+  name: string;
+  settings: KaleidoscopeSettings;
+  createdAt: number;
+}
+
+const PRESET_KEY = "wsv-kaleidoscope-presets-v1";
+const MAX_PRESETS = 12;
+const MAX_UNDO = 24;
+
+export function loadPresets(): UserPreset[] {
+  try {
+    const raw = localStorage.getItem(PRESET_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as UserPreset[];
+    return Array.isArray(parsed) ? parsed.slice(0, MAX_PRESETS) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function savePresets(list: UserPreset[]) {
+  try {
+    localStorage.setItem(PRESET_KEY, JSON.stringify(list.slice(0, MAX_PRESETS)));
+  } catch {
+    /* quota / private mode */
+  }
+}
+
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
 }
@@ -103,7 +263,7 @@ export function colorForPoint(
       };
     case "fire": {
       const heat = clamp(speed * 12 + 20, 15, 70);
-      return { h: heat + hueShift * 0.05, s: 95, l: 52 + heat * 0.12, a: 0.9 };
+      return { h: heat + hueShift * 0.05, s: 95, l: 52 + speed * 0.12, a: 0.9 };
     }
     case "ice":
       return {
@@ -151,6 +311,13 @@ export function randomizeSettings(
   };
 }
 
+type Snapshot = {
+  data: ImageData;
+  hasContent: boolean;
+  pathLen: number;
+  spinAccum: number;
+};
+
 export class KaleidoscopeEngine {
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
@@ -173,6 +340,10 @@ export class KaleidoscopeEngine {
   /** Accumulated continuous spin in degrees (added to axisAngle). */
   private spinAccum = 0;
   private onChange?: () => void;
+  private history: Snapshot[] = [];
+  private strokeOpen = false;
+  private demoAbort = false;
+  private demoTimer = 0;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -180,7 +351,7 @@ export class KaleidoscopeEngine {
     onChange?: () => void,
   ) {
     this.canvas = canvas;
-    const ctx = canvas.getContext("2d", { alpha: false });
+    const ctx = canvas.getContext("2d", { alpha: false, willReadFrequently: true });
     if (!ctx) throw new Error("2d context unavailable");
     this.ctx = ctx;
     this.settings = { ...settings };
@@ -189,7 +360,7 @@ export class KaleidoscopeEngine {
 
   mount() {
     this.resize();
-    this.clear();
+    this.clear(false);
     this.bind();
     this.prevFrame = performance.now();
     this.loop(this.prevFrame);
@@ -197,6 +368,7 @@ export class KaleidoscopeEngine {
 
   unmount() {
     cancelAnimationFrame(this.raf);
+    this.cancelDemo();
     this.unbind();
   }
 
@@ -207,6 +379,10 @@ export class KaleidoscopeEngine {
 
   getSettings() {
     return this.settings;
+  }
+
+  canUndo() {
+    return this.history.length > 0;
   }
 
   /** Effective axis rotation in radians (fixed angle + live spin). */
@@ -262,9 +438,64 @@ export class KaleidoscopeEngine {
         this.hasContent = true;
       }
     }
+
+    // Canvas size change invalidates history pixel buffers
+    this.history = [];
+    this.onChange?.();
   };
 
-  clear() {
+  private captureSnapshot(): Snapshot | null {
+    try {
+      const data = this.ctx.getImageData(
+        0,
+        0,
+        this.canvas.width,
+        this.canvas.height,
+      );
+      return {
+        data,
+        hasContent: this.hasContent,
+        pathLen: this.pathLen,
+        spinAccum: this.spinAccum,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private restoreSnapshot(snap: Snapshot) {
+    this.ctx.save();
+    this.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    this.ctx.putImageData(snap.data, 0, 0);
+    this.ctx.restore();
+    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    this.hasContent = snap.hasContent;
+    this.pathLen = snap.pathLen;
+    this.spinAccum = snap.spinAccum;
+  }
+
+  pushHistory() {
+    const snap = this.captureSnapshot();
+    if (!snap) return;
+    this.history.push(snap);
+    if (this.history.length > MAX_UNDO) this.history.shift();
+    this.onChange?.();
+  }
+
+  undo(): boolean {
+    this.cancelDemo();
+    const snap = this.history.pop();
+    if (!snap) return false;
+    this.restoreSnapshot(snap);
+    this.drawing = false;
+    this.strokeOpen = false;
+    this.onChange?.();
+    return true;
+  }
+
+  clear(recordHistory = true) {
+    this.cancelDemo();
+    if (recordHistory) this.pushHistory();
     this.ctx.save();
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     this.ctx.globalCompositeOperation = "source-over";
@@ -273,10 +504,130 @@ export class KaleidoscopeEngine {
     this.ctx.restore();
     this.hasContent = false;
     this.pathLen = 0;
+    this.onChange?.();
   }
 
   exportPng(): string {
     return this.canvas.toDataURL("image/png");
+  }
+
+  cancelDemo() {
+    this.demoAbort = true;
+    if (this.demoTimer) {
+      cancelAnimationFrame(this.demoTimer);
+      this.demoTimer = 0;
+    }
+  }
+
+  /**
+   * Apply settings, clear canvas, and animate a seed demo stroke.
+   */
+  async playSeed(seed: SeedLook): Promise<void> {
+    this.cancelDemo();
+    this.demoAbort = false;
+    this.settings = { ...seed.settings, frozen: false };
+    this.spinAccum = 0;
+    this.clear(true);
+    this.onChange?.();
+
+    const maxR = Math.min(this.w, this.h) * 0.38;
+    const points = this.buildDemoPath(seed.demo, maxR);
+    if (points.length < 2) return;
+
+    // Draw along path over ~1.4s
+    const duration = 1400;
+    const start = performance.now();
+    let lastIdx = 0;
+
+    await new Promise<void>((resolve) => {
+      const step = (now: number) => {
+        if (this.demoAbort) {
+          resolve();
+          return;
+        }
+        const t = clamp((now - start) / duration, 0, 1);
+        // ease-out cubic
+        const e = 1 - Math.pow(1 - t, 3);
+        const idx = Math.min(
+          points.length - 1,
+          Math.floor(e * (points.length - 1)),
+        );
+        while (lastIdx < idx) {
+          const a = points[lastIdx]!;
+          const b = points[lastIdx + 1]!;
+          const speed = Math.hypot(b.x - a.x, b.y - a.y) / 8;
+          this.stampLine(a.x, a.y, b.x, b.y, speed);
+          lastIdx++;
+        }
+        if (t < 1) {
+          this.demoTimer = requestAnimationFrame(step);
+        } else {
+          this.demoTimer = 0;
+          resolve();
+        }
+      };
+      this.demoTimer = requestAnimationFrame(step);
+    });
+  }
+
+  private buildDemoPath(
+    kind: DemoPath,
+    maxR: number,
+  ): { x: number; y: number }[] {
+    const pts: { x: number; y: number }[] = [];
+    const cx = this.cx;
+    const cy = this.cy;
+    const n = 90;
+
+    if (kind === "spiral") {
+      for (let i = 0; i <= n; i++) {
+        const t = i / n;
+        const ang = t * Math.PI * 4.5;
+        const r = maxR * (0.08 + t * 0.92);
+        pts.push({ x: cx + Math.cos(ang) * r, y: cy + Math.sin(ang) * r });
+      }
+    } else if (kind === "burst") {
+      for (let i = 0; i <= n; i++) {
+        const t = i / n;
+        const ang = -Math.PI * 0.65 + t * Math.PI * 1.3;
+        const r = maxR * (0.15 + Math.sin(t * Math.PI) * 0.85);
+        pts.push({ x: cx + Math.cos(ang) * r, y: cy + Math.sin(ang) * r });
+      }
+    } else if (kind === "orbit") {
+      for (let i = 0; i <= n; i++) {
+        const t = i / n;
+        const ang = t * Math.PI * 2;
+        const r = maxR * (0.55 + 0.2 * Math.sin(t * Math.PI * 4));
+        pts.push({ x: cx + Math.cos(ang) * r, y: cy + Math.sin(ang) * r });
+      }
+    } else if (kind === "ribbon") {
+      for (let i = 0; i <= n; i++) {
+        const t = i / n;
+        const x = cx + (t - 0.5) * maxR * 1.7;
+        const y = cy + Math.sin(t * Math.PI * 3) * maxR * 0.45;
+        pts.push({ x, y });
+      }
+    } else {
+      // web — radial spokes then arc (spider-inspired)
+      for (let s = 0; s < 5; s++) {
+        const ang = (s / 5) * Math.PI * 2 - Math.PI / 2;
+        for (let i = 0; i <= 12; i++) {
+          const t = i / 12;
+          const r = maxR * 0.12 + t * maxR * 0.88;
+          pts.push({
+            x: cx + Math.cos(ang) * r,
+            y: cy + Math.sin(ang) * r,
+          });
+        }
+      }
+      for (let i = 0; i <= 40; i++) {
+        const t = i / 40;
+        const ang = t * Math.PI * 2;
+        const r = maxR * 0.72;
+        pts.push({ x: cx + Math.cos(ang) * r, y: cy + Math.sin(ang) * r });
+      }
+    }
+    return pts;
   }
 
   private bind() {
@@ -307,10 +658,15 @@ export class KaleidoscopeEngine {
     if (this.settings.frozen) return;
     if (e.button !== undefined && e.button !== 0) return;
     e.preventDefault();
+    this.cancelDemo();
     try {
       this.canvas.setPointerCapture(e.pointerId);
     } catch {
       /* synthetic / already captured */
+    }
+    if (!this.strokeOpen) {
+      this.pushHistory();
+      this.strokeOpen = true;
     }
     this.drawing = true;
     const { x, y } = this.pointerPos(e);
@@ -344,6 +700,8 @@ export class KaleidoscopeEngine {
       /* already released */
     }
     this.drawing = false;
+    this.strokeOpen = false;
+    this.onChange?.();
   };
 
   private stampLine(
