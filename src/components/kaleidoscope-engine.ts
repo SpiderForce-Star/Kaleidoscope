@@ -321,7 +321,10 @@ type Snapshot = {
 export type EngineNotify = {
   canUndo?: boolean;
   settings?: KaleidoscopeSettings;
+  /** Fired when a paint stroke ends — UI can offer “Spin with this color”. */
+  strokeEnd?: { h: number; s: number; l: number };
 };
+
 
 export class KaleidoscopeEngine {
   canvas: HTMLCanvasElement;
@@ -360,6 +363,9 @@ export class KaleidoscopeEngine {
   private resizeTimer = 0;
   private trailAcc = 0;
   private glowMode = true;
+  private lastColor = { h: 200, s: 80, l: 55 };
+  private strokePainted = false;
+
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -421,6 +427,52 @@ export class KaleidoscopeEngine {
 
   getEffectiveAxisDeg() {
     return (((this.settings.axisAngle + this.spinAccum) % 360) + 360) % 360;
+  }
+
+  getLastColor() {
+    return { ...this.lastColor };
+  }
+
+  hasPaint() {
+    return this.hasContent;
+  }
+
+  /**
+   * Hold painted color spots forever and spin the view with them.
+   * Freezes new paint so the show can spin cleanly.
+   */
+  startColorSpin(speed = 14): KaleidoscopeSettings {
+    const hue = ((this.lastColor.h % 360) + 360) % 360;
+    const spin =
+      this.settings.axisSpin > 0
+        ? this.settings.axisSpin
+        : Math.max(4, Math.min(48, speed));
+    const next: KaleidoscopeSettings = {
+      ...this.settings,
+      trail: 0,
+      frozen: true,
+      axisSpin: spin,
+      monoHue: hue,
+      hueShift: hue,
+      glow: true,
+    };
+    this.settings = next;
+    this.glowMode = true;
+    this.axisCacheDeg = Number.NaN;
+    this.onNotify?.({ settings: next, canUndo: this.canUndo() });
+    return next;
+  }
+
+  stopColorSpin(): KaleidoscopeSettings {
+    const next: KaleidoscopeSettings = {
+      ...this.settings,
+      frozen: false,
+      axisSpin: 0,
+    };
+    this.settings = next;
+    this.axisCacheDeg = Number.NaN;
+    this.onNotify?.({ settings: next, canUndo: this.canUndo() });
+    return next;
   }
 
   private updateAxisCache() {
@@ -743,6 +795,7 @@ export class KaleidoscopeEngine {
       this.strokeOpen = true;
     }
     this.drawing = true;
+    this.strokePainted = false;
     this.updateAxisCache();
     const { x, y } = this.pointerPos(e);
     this.lastX = x;
@@ -778,7 +831,11 @@ export class KaleidoscopeEngine {
     }
     this.drawing = false;
     this.strokeOpen = false;
-    this.onNotify?.({ canUndo: this.canUndo() });
+    const notify: EngineNotify = { canUndo: this.canUndo() };
+    if (this.strokePainted && this.hasContent) {
+      notify.strokeEnd = { ...this.lastColor };
+    }
+    this.onNotify?.(notify);
   };
 
   private stampLine(
@@ -831,6 +888,8 @@ export class KaleidoscopeEngine {
       pathLen: this.pathLen,
       time: performance.now() + this.autoHue * 1000,
     });
+    this.lastColor = { h: c.h, s: c.s, l: c.l };
+    this.strokePainted = true;
 
     const size =
       this.settings.brushSize *

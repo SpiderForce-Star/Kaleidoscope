@@ -22,6 +22,7 @@ import {
   Maximize2,
   Minimize2,
   Bookmark,
+  RotateCcw,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -104,10 +105,21 @@ export function KaleidoscopeApp() {
   /** Intro WSV credit — few seconds on open only */
   const [intro, setIntro] = useState(true);
   const [introOut, setIntroOut] = useState(false);
+  /** Offer “Spin with this color” after painting a spot */
+  const [colorSpinOffer, setColorSpinOffer] = useState<{
+    h: number;
+    s: number;
+    l: number;
+  } | null>(null);
+  const [autoSpinAfterPaint, setAutoSpinAfterPaint] = useState(false);
   const axisSpinRef = useRef(0);
   const showAxesRef = useRef(false);
   const lastAxisUi = useRef(0);
+  const autoSpinRef = useRef(false);
   const trailHold = settings.trail < 0.08;
+  const colorSpinActive =
+    settings.frozen && settings.axisSpin > 0 && trailHold;
+
 
   const pushToast = useCallback((msg: string) => {
     setToast(msg);
@@ -119,21 +131,36 @@ export function KaleidoscopeApp() {
   }, []);
 
   useEffect(() => {
+    autoSpinRef.current = autoSpinAfterPaint;
+  }, [autoSpinAfterPaint]);
+
+  useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const engine = new KaleidoscopeEngine(canvas, DEFAULT_SETTINGS, (n) => {
       if (n.canUndo !== undefined) setCanUndo(n.canUndo);
       if (n.settings) setSettings({ ...n.settings });
+      if (n.strokeEnd) {
+        if (autoSpinRef.current) {
+          const next = engine.startColorSpin(14);
+          setSettings(next);
+          setColorSpinOffer(null);
+          setHint(false);
+        } else {
+          setColorSpinOffer(n.strokeEnd);
+        }
+      }
     });
     engineRef.current = engine;
     engine.mount();
     setPresets(loadPresets());
 
-    // Hide panel when user starts painting (more canvas, fewer finger fights)
     const hidePanel = () => {
       if (isMobileStart()) setPanelOpen(false);
       setHint(false);
+      setColorSpinOffer(null);
     };
+
     canvas.addEventListener("pointerdown", hidePanel);
     return () => {
       canvas.removeEventListener("pointerdown", hidePanel);
@@ -212,9 +239,11 @@ export function KaleidoscopeApp() {
 
   const onClear = () => {
     engineRef.current?.clear(true);
+    setColorSpinOffer(null);
     syncEngineFlags();
     pushToast("Canvas cleared");
   };
+
 
   const onUndo = () => {
     const ok = engineRef.current?.undo();
@@ -228,6 +257,12 @@ export function KaleidoscopeApp() {
   };
 
   const onFreeze = () => {
+    if (colorSpinActive) {
+      const next = engineRef.current?.stopColorSpin();
+      if (next) setSettings(next);
+      pushToast("Spin stopped — paint again");
+      return;
+    }
     const frozen = !settings.frozen;
     update({ frozen });
     pushToast(
@@ -237,6 +272,28 @@ export function KaleidoscopeApp() {
           : "Frame frozen"
         : "Live again",
     );
+  };
+
+  const onSpinWithColor = () => {
+    const eng = engineRef.current;
+    if (!eng?.hasPaint()) {
+      pushToast("Paint a spot first");
+      return;
+    }
+    const next = eng.startColorSpin(
+      settings.axisSpin > 0 ? settings.axisSpin : 14,
+    );
+    setSettings(next);
+    setColorSpinOffer(null);
+    setPanelOpen(false);
+    setHint(false);
+    pushToast("Spinning with your color");
+  };
+
+  const onStopColorSpin = () => {
+    const next = engineRef.current?.stopColorSpin();
+    if (next) setSettings(next);
+    pushToast("Back to painting");
   };
 
   const onExport = () => {
@@ -340,6 +397,12 @@ export function KaleidoscopeApp() {
     } as const;
   }, [trailHold, settings.axisSpin, settings.frozen, liveAxisDeg]);
 
+  const spinSwatch = colorSpinOffer
+    ? `hsl(${((colorSpinOffer.h % 360) + 360) % 360} ${colorSpinOffer.s}% ${colorSpinOffer.l}%)`
+    : colorSpinActive
+      ? `hsl(${((settings.hueShift % 360) + 360) % 360} 80% 55%)`
+      : null;
+
   const activeTrailPreset = TRAIL_PRESETS.find((p) =>
     p.id === "hold"
       ? settings.trail < 0.08
@@ -407,9 +470,21 @@ export function KaleidoscopeApp() {
             icon={<Undo2 className="size-5" strokeWidth={1.75} />}
           />
           <ActionButton
-            active={settings.frozen}
+            active={colorSpinActive}
+            onClick={colorSpinActive ? onStopColorSpin : onSpinWithColor}
+            label={colorSpinActive ? "Stop spin" : "Spin color"}
+            icon={<RotateCw className="size-5" strokeWidth={1.75} />}
+          />
+          <ActionButton
+            active={settings.frozen && !colorSpinActive}
             onClick={onFreeze}
-            label={settings.frozen ? "Unfreeze" : "Hold frame"}
+            label={
+              colorSpinActive
+                ? "Stop spin"
+                : settings.frozen
+                  ? "Unfreeze"
+                  : "Hold frame"
+            }
             icon={<Snowflake className="size-5" strokeWidth={1.75} />}
           />
           <ActionButton
@@ -456,9 +531,63 @@ export function KaleidoscopeApp() {
       {hint && !intro && (
         <div className="pointer-events-none absolute left-1/2 top-[36%] z-10 -translate-x-1/2 -translate-y-1/2 text-center px-4">
           <p className="rounded-2xl border border-border bg-panel px-5 py-3.5 text-sm text-muted shadow-panel backdrop-blur-md max-w-xs">
-            Drag to paint. Open <span className="text-fg">Menu</span> for Hold /
-            Fade & spin.
+            Tap to paint a color spot, then{" "}
+            <span className="text-fg">Spin color</span> to keep it spinning.
           </p>
+        </div>
+      )}
+
+      {/* After painting: offer spin with that color */}
+      {colorSpinOffer && !colorSpinActive && !intro && (
+        <div className="absolute left-1/2 z-30 -translate-x-1/2 bottom-[5.5rem] sm:bottom-24 px-3 w-full max-w-sm">
+          <div className="flex items-center gap-2 rounded-2xl border border-border bg-panel/95 p-2 shadow-panel backdrop-blur-md">
+            <span
+              className="size-11 shrink-0 rounded-xl ring-2 ring-white/20 shadow-inner"
+              style={{ background: spinSwatch ?? "#888" }}
+              aria-hidden
+            />
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-semibold text-fg leading-tight">
+                Spin with this color
+              </p>
+              <p className="text-[11px] text-muted leading-snug">
+                Hold the spot and spin the view
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={onSpinWithColor}
+              className="flex h-12 min-w-[5.5rem] items-center justify-center gap-1.5 rounded-xl border border-accent bg-accent px-3 text-sm font-semibold text-accent-fg active:scale-[0.98]"
+            >
+              <RotateCw className="size-4" strokeWidth={2} />
+              Spin
+            </button>
+            <button
+              type="button"
+              onClick={() => setColorSpinOffer(null)}
+              className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-border bg-surface text-muted"
+              aria-label="Dismiss"
+            >
+              <X className="size-5" strokeWidth={1.75} />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {colorSpinActive && (
+        <div className="absolute left-1/2 z-30 -translate-x-1/2 bottom-[5.5rem] sm:bottom-24 px-3">
+          <button
+            type="button"
+            onClick={onStopColorSpin}
+            className="flex h-12 items-center gap-2 rounded-2xl border border-border bg-panel/95 px-4 text-sm font-semibold text-fg shadow-panel backdrop-blur-md active:scale-[0.98]"
+          >
+            <span
+              className="size-6 rounded-md ring-1 ring-white/20"
+              style={{ background: spinSwatch ?? "#888" }}
+            />
+            Stop color spin
+            <RotateCcw className="size-4 text-muted" strokeWidth={1.75} />
+          </button>
         </div>
       )}
 
@@ -527,13 +656,57 @@ export function KaleidoscopeApp() {
                 </button>
               ))}
             </div>
-            {trailHold && (
-              <p className="mt-2 text-[11px] text-muted leading-snug">
-                Hold keeps colors forever. Add Spin, paint, then tap{" "}
-                <span className="text-fg/90">Hold frame</span> — the view spins
-                for a constant show. Soft / Fast fade for temporary trails.
-              </p>
-            )}
+          </div>
+
+          {/* Spin with color — main feature */}
+          <div className="mb-4 rounded-xl border border-border bg-surface/80 p-3">
+            <p className="mb-2 text-[11px] font-medium uppercase tracking-wider text-subtle">
+              Spin with color
+            </p>
+            <p className="mb-3 text-[12px] text-muted leading-snug">
+              After you touch and paint a spot, spin keeps those colors turning
+              on screen. Or turn on auto-spin for every stroke.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={colorSpinActive ? onStopColorSpin : onSpinWithColor}
+                className={cn(
+                  "inline-flex min-h-12 flex-1 items-center justify-center gap-2 rounded-xl border px-4 text-sm font-semibold",
+                  colorSpinActive
+                    ? "border-accent bg-accent text-accent-fg"
+                    : "border-border bg-panel text-fg active:bg-surface-raised",
+                )}
+              >
+                {spinSwatch && (
+                  <span
+                    className="size-5 rounded-md ring-1 ring-black/30"
+                    style={{ background: spinSwatch }}
+                  />
+                )}
+                <RotateCw className="size-4" strokeWidth={2} />
+                {colorSpinActive ? "Stop spin" : "Spin painted colors"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setAutoSpinAfterPaint((v) => !v);
+                  pushToast(
+                    !autoSpinAfterPaint
+                      ? "Auto-spin on — each spot spins"
+                      : "Auto-spin off",
+                  );
+                }}
+                className={cn(
+                  "inline-flex min-h-12 items-center justify-center gap-2 rounded-xl border px-4 text-sm font-medium",
+                  autoSpinAfterPaint
+                    ? "border-accent bg-accent text-accent-fg"
+                    : "border-border bg-panel text-muted",
+                )}
+              >
+                Auto
+              </button>
+            </div>
           </div>
 
           {/* Seeds — larger chips */}
